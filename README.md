@@ -1566,3 +1566,3450 @@ Compose is for single-host deployments. Kubernetes is for multi-host clusters wi
 **THE ONE SENTENCE THAT WINS ANY INTERVIEW**
 "Every decision in this project follows one principle — contain the blast radius. I assumed something would go wrong and designed the system so that when it does, the damage stays local."*Olamide Olalekan — Platform and DevSecOps Engineer*
 *[LinkedIn](https://linkedin.com/in/olamide-olalekan-12138a265) | [GitHub](https://github.com/velrite)*
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ # -----------------------------------------------------------------------------------------------------------------
+
+
+
+
+ # MASTER TECHNICAL, ENGINEERING, CAREER & PORTFOLIO SOURCE-OF-TRUTH
+
+Purpose: Comprehensive factual source of truth for future CVs, applications, interviews, portfolio pages, LinkedIn positioning, technical discussions, and career strategy.
+
+Important: This is not a CV. It is an engineering/career evidence archive.
+
+The information below must preserve the distinction between:
+
+- Verified — actually tested/demonstrated and supported by evidence.
+- Implemented — built/deployed, but not necessarily subjected to the strongest verification.
+- Configured — configuration exists and was applied, but behavior may not have been observed.
+- Unverified — configured or intended, but the claimed runtime behavior was not proven.
+- Planned — intended but not built at the relevant point in time.
+- Simulated — modeled/test environment rather than real production.
+- Production-modeled / production-shaped — designed and operated with production concerns, but not professional production infrastructure.
+- Limited — explicitly constrained by environment, quota, missing dependency, or scope.
+- Excluded — intentionally outside the project's failure model or scope.
+
+No project may be represented as professional production employment unless there is actual professional production evidence.
+
+---
+
+1. CORE PROFESSIONAL IDENTITY
+
+1.1 Current technical direction
+
+The user's career direction is toward:
+
+- Platform Engineering
+- DevSecOps
+- Cloud Infrastructure Engineering
+- Infrastructure Engineering
+- DevOps Engineering
+- Site Reliability Engineering / SRE
+- Kubernetes / Platform Reliability
+- Cloud security / software supply-chain security
+- Distributed systems infrastructure
+- Infrastructure cost / FinOps engineering
+
+The strongest positioning is around building infrastructure that remains reliable, secure, observable and recoverable under failure, rather than merely making infrastructure deploy successfully.
+
+Core positioning concepts:
+
+«“I design infrastructure that holds under failure.”»
+
+«“Not systems that pass staging.”»
+
+Failure conditions of interest include:
+
+- node loss
+- traffic spikes
+- bad deployments
+- deployment failures at 3am
+- capacity exhaustion
+- credential/security failures
+- configuration drift
+- network problems
+- workload crashes
+- infrastructure dependency failures
+- regional failure
+- cloud cost growth
+
+Desired characteristic:
+
+«Recovery should happen without human intervention where the architecture is designed to support it.»
+
+Systems mindset:
+
+«“Failure is not an exception; it is a design input.”»
+
+This connects the user's Mechatronics Engineering background with platform engineering: systems are designed around behavior under abnormal conditions rather than only nominal operation.
+
+---
+
+2. CAREER OBJECTIVES
+
+2.1 Target roles
+
+Primary targets:
+
+- Platform Engineer
+- DevSecOps Engineer
+- Cloud Infrastructure Engineer
+- Infrastructure Engineer
+- DevOps Engineer
+- SRE
+- Kubernetes Engineer
+- Platform Reliability Engineer
+
+Potential contract positioning:
+
+- Remote Platform Engineering contractor
+- Remote DevSecOps contractor
+- Cloud Infrastructure contractor
+- Reliability/platform consultant
+
+2.2 Target employers / markets
+
+Desired international markets include:
+
+- United States
+- United Kingdom
+- Canada
+- Germany
+- Netherlands
+
+Target decision-makers / buyers:
+
+- CTOs
+- VPs of Engineering
+- Heads of Infrastructure
+- Platform Engineering leaders
+- Principal Engineers
+- Staff Engineers
+
+Particularly relevant companies are mid-sized to large organizations that need infrastructure engineering rather than purely application development.
+
+2.3 Compensation objective
+
+The long-term stated compensation target is:
+
+$20,000/month
+
+Earlier target was approximately:
+
+$10,000/month
+
+The user explicitly wants realistic assessment rather than false encouragement.
+
+Previous candid market-positioning assessment indicated that immediate $20k/month should not be treated as the baseline expectation for the user's current professional profile.
+
+Earlier estimated ranges discussed were approximately:
+
+- first international breakthrough: ~$50k–$80k/year
+- stronger opportunity: ~$80k–$100k
+- potentially ~$100k–$130k depending on employer/interview performance
+- ~$130k–$160k+ not considered baseline
+- ~$180k–$240k as a longer-term possibility
+
+These figures are historical strategic estimates, not current market quotations and should be refreshed through web research before being used as current compensation data.
+
+---
+
+3. LOCATION / INTERNATIONAL POSITIONING
+
+The user is based in Nigeria and wants to work internationally.
+
+The objective is not to conceal Nigerian location.
+
+The positioning goal is to demonstrate international engineering capability through:
+
+- technically serious projects
+- public engineering evidence
+- reproducible infrastructure
+- measurable test results
+- incident analysis
+- architecture decisions
+- security controls
+- reliability testing
+- GitHub evidence
+- technical writing
+- LinkedIn visibility
+- international remote applications
+
+The user's location should not be presented as an inherent technical disadvantage.
+
+The objective is to make the portfolio communicate:
+
+«“This engineer can reason about infrastructure at international engineering standards.”»
+
+rather than:
+
+«“This is a candidate trying to compensate for geography.”»
+
+---
+
+4. EDUCATIONAL BACKGROUND
+
+4.1 University
+
+Degree/background:
+
+Mechatronics Engineering
+
+Country:
+
+Nigeria
+
+Relevant technical learning included:
+
+- C++
+- MATLAB
+- CNN / computer vision-related learning
+- CNC
+- C
+- Python
+
+Explicit correction:
+
+Java was not part of the stated programming background.
+
+University coursework included concepts around:
+
+- system design
+- failure design
+
+This systems/failure orientation is relevant to the later platform engineering philosophy.
+
+---
+
+5. EARLIER EDUCATION / LEADERSHIP
+
+5.1 Junior secondary
+
+Attended a:
+
+public government junior secondary school
+
+5.2 Senior secondary
+
+Attended a:
+
+private senior secondary school
+
+Roles included:
+
+- Health Prefect
+- Social Prefect
+
+Health Prefect context included the SS3 period.
+
+These should not be inflated into professional engineering experience.
+
+---
+
+6. CENTER FOR TECH EXPERIENCE
+
+6.1 Early technical exposure
+
+The user had an internship / short-term technical-learning period at Center for Tech.
+
+Work/learning included robotics and electronics from fundamental components upward.
+
+Topics included:
+
+- electronic components
+- resistors
+- Arduino
+- robotics
+- Arduino interfacing
+- MIT App Inventor / MIT App connection to Arduino
+- Flutter
+
+The user learned Flutter from a software engineer at the organization.
+
+Projects included:
+
+- electrical projects
+- security alarm projects
+- team projects
+
+This period represents the transition from hardware/mechatronics into software and automation.
+
+---
+
+7. CENTER FOR TECH MENTOR / TECHNICAL INSTRUCTOR EXPERIENCE
+
+The user later had a short-term role as a mentor/technical instructor at Center for Tech.
+
+Responsibilities included teaching practical technology projects.
+
+The user taught:
+
+20+ students
+
+Students were taken through:
+
+- practical projects
+- take-home projects
+- iterative building
+- engineering problem solving
+
+Projects included:
+
+Automated farm project
+
+Students built an automated farming project using:
+
+- ultrasonic sensing
+- sensor-triggered behavior
+- automatic actuation
+
+Line-following robot
+
+A group built a:
+
+line-following robot
+
+The user describes the overall program as successful.
+
+This is legitimate teaching/technical experience but should not be represented as professional Platform Engineering employment.
+
+---
+
+8. CAREER TRANSITION
+
+The career progression is:
+
+Mechatronics Engineering
+→ electronics / robotics
+→ programming
+→ automation
+→ technical teaching / mentoring
+→ software infrastructure
+→ Docker / Kubernetes
+→ Terraform
+→ cloud infrastructure
+→ GitOps
+→ security / DevSecOps
+→ observability
+→ reliability engineering
+→ distributed systems
+→ platform engineering
+
+This is important because the portfolio is not random tool accumulation.
+
+The underlying theme is systems engineering.
+
+---
+
+9. CORE TECHNOLOGY STACK
+
+Technologies explicitly listed as part of the user's stack include:
+
+Cloud
+
+- AWS
+- Azure
+- GCP
+
+Containers / orchestration
+
+- Kubernetes
+- Docker
+- GKE
+- GKE Autopilot
+- Amazon EKS
+
+Infrastructure as Code
+
+- Terraform
+- Terraform modules
+- Terraform remote state
+- Terraform provider ecosystem
+
+CI/CD
+
+- GitLab CI/CD
+- GitHub Actions
+- Argo CD
+- Argo Rollouts
+
+Configuration / automation
+
+- Ansible
+- Puppet
+
+Secrets / identity
+
+- Vault
+- Workload Identity
+- Workload Identity Federation
+- IRSA
+- OIDC
+- service-account impersonation
+
+Security
+
+- Kyverno
+- Falco
+- OPA
+- OPA/Conftest
+- OPA Gatekeeper
+- Trivy
+- Gitleaks
+- TruffleHog
+- tfsec
+- Checkov
+- Syft
+- Cosign
+- kube-bench
+
+Service mesh
+
+- Istio
+
+Observability
+
+- Prometheus
+- Grafana
+- Alertmanager
+- Loki
+- Tempo
+- OpenTelemetry
+- Google Managed Prometheus
+
+Cost / FinOps
+
+- OpenCost
+- cloud billing data
+- workload / namespace attribution
+
+Reliability / chaos
+
+- Litmus
+- LitmusChaos
+- Chaos Mesh
+- SLOs
+- error budgets
+- PDBs
+- HPA
+- cluster/node failure testing
+
+Data / infrastructure services
+
+- PostgreSQL
+- Redis
+- Redis Sentinel
+- Patroni
+- etcd
+
+Platform tooling
+
+- Backstage
+- Kustomize
+- Artifact Registry
+
+Application / mobile
+
+- Python 3.12
+- FastAPI
+- Flutter
+- Android
+
+---
+
+10. ENGINEERING EVIDENCE PRINCIPLES
+
+The user's engineering work should be evaluated according to an evidence hierarchy.
+
+From weaker to stronger evidence:
+
+1. Terraform/code exists.
+2. Configuration was applied.
+3. Screenshots exist.
+4. Live cloud environment exists.
+5. Public application / live metrics exist.
+6. Architecture + deployment history + telemetry exist.
+7. Failure test exists.
+8. Failure test has measured result.
+9. Incident was discovered unexpectedly.
+10. Root cause was established.
+11. Fix was implemented.
+12. Fix was re-tested.
+13. Behavior was measured under repeated / realistic conditions.
+14. Real users/business impact exists.
+
+The user specifically does not want invented metrics.
+
+Only numbers that were actually tested/documented should be used.
+
+---
+
+11. PORTFOLIO CLASSIFICATION
+
+Current hierarchy:
+
+Tier 1 — Flagship systems
+
+1. Atlas — Distributed Resilience Platform
+2. Enterprise Cloud Platform / Velrite — AWS EKS
+
+Tier 2 — Major engineering systems
+
+3. Forge — Internal Developer Platform
+4. Production-Oriented AI Inference Platform — GCP
+
+Tier 3 — Engineering Labs
+
+5. Auto-Healing Kubernetes Platform
+6. Terraform Kubernetes Platform
+7. GitOps ArgoCD Platform
+
+The three Engineering Labs should not be presented as equivalent to the flagship systems.
+
+They are foundational evidence.
+
+---
+
+12. ENGINEERING LAB — AUTO-HEALING KUBERNETES PLATFORM
+
+Classification
+
+Engineering Lab / foundational Kubernetes reliability platform
+
+Themes:
+
+- Kubernetes reliability
+- failure recovery
+- observability
+- secrets management
+- autoscaling
+- FinOps
+- CI/CD
+
+---
+
+12.1 Kubernetes environment
+
+Verified environment:
+
+- 3-node Minikube cluster
+- Kubernetes v1.31.0
+- Docker driver
+
+A missing "docker-proxy" problem was manually identified and fixed.
+
+This was an actual environment issue rather than a theoretical configuration exercise.
+
+---
+
+13. AUTO-HEALING NAMESPACES
+
+Namespaces:
+
+- "microservices"
+- "monitoring"
+- "vault"
+- "opencost"
+
+Workloads included:
+
+- PostgreSQL
+- API
+- frontend
+
+Services were created for the application components.
+
+---
+
+14. RESOURCE GOVERNANCE
+
+Implemented:
+
+- LimitRange
+- ResourceQuota
+
+This established explicit resource governance instead of allowing workloads to consume uncontrolled cluster resources.
+
+---
+
+15. HPA CONFIGURATION AND RESULTS
+
+API
+
+- minimum replicas: 2
+- maximum replicas: 8
+- CPU threshold: 60%
+- memory threshold: 70%
+
+Frontend
+
+- minimum replicas: 2
+- maximum replicas: 6
+- CPU threshold: 65%
+
+Metrics Server was enabled.
+
+Verified scaling result
+
+Under load:
+
+2 pods → 8 pods
+
+Observed CPU:
+
+86%
+
+After load was removed:
+
+8 pods → 2 pods
+
+CPU fell to approximately:
+
+2%
+
+This is a real measured autoscaling result and must not be reduced to merely “HPA configured.”
+
+---
+
+16. PROMETHEUS / GRAFANA
+
+Installed using Helm:
+
+- Prometheus
+- Grafana
+
+Created:
+
+36 alert rules
+
+Custom alerts included:
+
+- "PodCrashLooping"
+- "PodNotReady"
+- "HighMemoryUsage"
+- "HighCPUUsage"
+- "HighErrorRate"
+- "NodeDown"
+
+A Golden Signals dashboard was created with:
+
+- Latency
+- Traffic
+- Errors
+- Saturation
+
+Important limitation:
+
+Only Saturation had actual data.
+
+The other Golden Signals lacked useful application-level telemetry because nginx did not expose a Prometheus-compatible application metrics endpoint.
+
+This is a critical distinction:
+
+Dashboard configured ≠ all four signals verified.
+
+---
+
+17. VAULT
+
+Vault was deployed through Helm in:
+
+development mode
+
+Vault was:
+
+- initialized
+- unsealed
+- configured for Kubernetes authentication
+
+Secrets functionality included:
+
+- database secrets engine
+- database role
+- KV v2
+
+Dynamic credentials test
+
+The database credentials engine generated credentials twice.
+
+The generated:
+
+- usernames differed
+- passwords differed
+
+This demonstrated dynamic credential issuance rather than static database credentials.
+
+Zero-credential proof
+
+The pod description was checked to confirm credentials were not directly embedded in the pod configuration.
+
+KV v2 rotation
+
+A KV v2 secret was rotated:
+
+v1 → v2
+
+The rotation was tested with:
+
+zero downtime
+
+Important limitation:
+
+Full dynamic DB credential lifecycle/rotation still has additional infrastructure dependencies such as DNS and connection handling.
+
+---
+
+18. OPENCOST
+
+Kubecost was attempted first.
+
+Kubecost failed due to a permission/problem encountered during installation.
+
+Instead:
+
+OpenCost was installed.
+
+Verified:
+
+- OpenCost "2/2 Running"
+- API returned real JSON
+- cost labels were applied to deployments
+- port-forward/UI was confirmed
+
+The project therefore demonstrated actual cost visibility rather than simply mentioning FinOps.
+
+Infrastructure cost:
+
+$0, because the environment was local.
+
+---
+
+19. AUTO-HEALING CI/CD
+
+GitHub Actions pipeline contained five stages:
+
+1. "validate"
+2. "deploy-canary"
+3. "validate-canary"
+4. "rollback"
+5. "deploy-production"
+
+Pipeline result:
+
+Green in 48 seconds
+
+Canary behavior included:
+
+- health checks
+- restart-count checking
+- automatic rollback
+
+---
+
+20. AUTO-HEALING FAILURE TESTS
+
+Node failure
+
+Node:
+
+"m02"
+
+was killed.
+
+Observed recovery:
+
+20 seconds
+
+Result:
+
+SLO met
+
+This is one of the strongest pieces of evidence from the lab.
+
+---
+
+Bad image deployment
+
+A bad image deployment was introduced.
+
+Observed rollback:
+
+32 seconds
+
+Blast radius:
+
+0
+
+This demonstrated that the failure did not propagate to unaffected production workloads.
+
+---
+
+HPA failure/load test
+
+Replica count:
+
+2 → 8
+
+CPU:
+
+86%
+
+After pressure disappeared:
+
+8 → 2
+
+CPU:
+
+2%
+
+---
+
+Vault rotation
+
+Secret rotation was tested with:
+
+zero downtime
+
+---
+
+21. AUTO-HEALING INCIDENTS
+
+Actual problems encountered:
+
+1. Missing "docker-proxy"
+2. Memory exhaustion
+3. Kubecost failure / permission issue
+4. HPA unknown metrics
+5. Git history contamination
+
+These incidents matter because they show the project was not simply generated from a clean tutorial path.
+
+---
+
+22. GIT SECURITY INCIDENT
+
+The repository initially contained sensitive material / credential contamination.
+
+Actions taken:
+
+- ".gitignore" updated for:
+  - Terraform state
+  - tfvars
+  - binaries
+- "vault-init.json" excluded.
+- large binaries removed from history.
+- "git filter-branch" used multiple times.
+- Git history was scrubbed.
+- "git-filter-repo" was used to remove a hardcoded password.
+- repository was pushed clean to GitHub.
+- history was checked afterward.
+
+This incident became part of the engineering evidence.
+
+---
+
+23. AUTO-HEALING ADRs
+
+Architecture Decision Records covered:
+
+- Minikube vs kind
+- OpenCost vs Kubecost
+- GitHub Actions vs GitLab CI
+- Vault dev mode vs standalone
+- CI-based canary vs Argo Rollouts
+
+---
+
+24. AUTO-HEALING GAPS
+
+Explicit gaps:
+
+- application metrics incomplete
+- dynamic DB credential full rotation requires additional infrastructure such as DNS/connection handling
+- no PDB
+- no NetworkPolicy
+- no persistent Grafana dashboards
+- no image signing
+
+Therefore this project should remain an:
+
+Engineering Lab
+
+rather than being presented as production infrastructure.
+
+---
+
+25. ENGINEERING LAB — TERRAFORM KUBERNETES PLATFORM
+
+Classification
+
+Engineering Lab / Infrastructure-as-Code foundation
+
+Primary themes:
+
+- Terraform
+- Kubernetes provisioning
+- modules
+- security scanning
+- CI/CD
+- infrastructure reproducibility
+
+---
+
+26. TERRAFORM VERSION / PROVIDERS
+
+Terraform:
+
+v1.7.5
+
+Providers:
+
+- Kubernetes "v2.38"
+- Helm "v2.17"
+- null "v3.3"
+
+---
+
+27. TERRAFORM MODULE STRUCTURE
+
+Modules covered:
+
+- namespaces
+- microservices
+- monitoring
+- Vault
+- OpenCost
+
+All five module files were created and verified.
+
+Sensitive variables were used.
+
+Terraform variable files were excluded from Git.
+
+---
+
+28. TERRAFORM RESOURCE RESULT
+
+Terraform planned/applied:
+
+13 resources
+
+"terraform state list" confirmed all 13 resources.
+
+Resource set included:
+
+1. microservices namespace
+2. monitoring namespace
+3. vault namespace
+4. opencost namespace
+5. postgres-secret
+6. postgres-db deployment
+7. api-service deployment
+8. frontend deployment
+9. api-service service
+10. frontend service
+11. Prometheus + Grafana Helm release
+12. HashiCorp Vault Helm release
+13. OpenCost Helm release
+
+---
+29. TERRAFORM CI/CD
+
+GitHub Actions stages included:
+
+Security scan
+
+- TruffleHog
+- tfsec
+- Checkov
+
+Validation
+
+- "terraform fmt -check"
+- "terraform init"
+- "terraform validate"
+
+Security ran first.
+
+If a credential was discovered, the pipeline stopped before validation/deployment could continue.
+
+Pipeline was confirmed fully green after fixes.
+
+---
+
+30. TERRAFORM INCIDENT
+
+A hardcoded:
+
+"grafana_password"
+
+was discovered.
+
+Actions:
+
+- password removed
+- Git history scrubbed with "git-filter-repo"
+- history force-pushed
+- clean history verified using Git log search
+
+Other issues:
+
+- terminal paste corruption
+- Terraform apply initially appearing to show 0 resources
+
+These became part of the engineering debugging history.
+
+---
+
+31. TERRAFORM ADRs
+
+Decisions documented:
+
+- modules vs flat configuration
+- local vs remote state
+- "depends_on" vs outputs
+- Helm provider vs raw Kubernetes manifests
+
+---
+
+32. TERRAFORM GAPS
+
+Not implemented:
+
+- remote state
+- Terraform workspaces
+- apply inside CI
+- HPA managed through Terraform
+
+The README's central engineering lesson:
+
+The platform was rebuilt from Project 1 as code so that:
+
+«the Terraform code becomes the record of how the infrastructure is created.»
+
+The conceptual objective was:
+
+Destroy everything → run Terraform → reproduce the same platform.
+
+This was specifically intended to eliminate dependence on remembering manual command order.
+
+---
+
+33. ENGINEERING LAB — GITOPS ARGOCD PLATFORM
+
+Classification
+
+Engineering Lab / GitOps foundation
+
+Themes:
+
+- GitOps
+- Kubernetes delivery
+- Argo CD
+- progressive delivery
+- policy-as-code
+- configuration management
+
+Core principle:
+
+«Git is the source of truth.»
+
+Rollback model:
+
+«Git revert rather than manual "kubectl".»
+
+---
+
+34. ARGO INSTALLATION
+Argo CD and Argo Rollouts were installed through Terraform.
+Argo CD Helm chart:
+v7.3.11
+Argo Rollouts was also installed as a Terraform helm_release.
+35. KUSTOMIZE
+Environment structure:
+staging
+production
+Kustomize overlays were used.
+Both applications reached:
+Synced + Healthy
+Applications:
+argocd/staging-api-service
+argocd/production-api-service
+36. GITOPS DRIFT TEST
+A deliberate manual change was introduced:
+kubectl scale deployment api-service -n production --replicas=5
+Desired Git state remained:
+2 replicas
+Argo CD reconciled the cluster.
+Measured drift correction:
+under 2 seconds
+The cluster returned to the desired replica count before the second kubectl command returned.
+This is actual demonstrated reconciliation behavior.
+37. ARGOCD RBAC
+AppProject roles:
+platform-admin
+Could:
+sync any application
+manage clusters
+manage repositories
+developer
+Could:
+view all
+sync staging
+not modify production
+This demonstrated environment-specific delivery boundaries.
+38. APPLICATIONSET
+An ApplicationSet matrix generator was used.
+One template generated:
+staging
+production
+Adding another environment required only another entry in the generator list.
+This demonstrated templated multi-environment GitOps rather than duplicated application definitions.
+39. SYNC WAVES
+Configured order:
+Wave 0: Namespace
+Wave 1: ConfigMap + Services
+Wave 2: Deployments
+Wave 3: Rollouts
+40. CANARY CONFIGURATION
+Argo Rollout sequence:
+10% → 30-second pause → 25% → 30-second pause → 50% → 30-second pause → 100%
+Important distinction:
+The canary configuration existed, but the lab's actual canary trigger was not fully verified.
+Therefore:
+configured ≠ proven runtime progressive delivery
+41. SECURITY POLICIES
+OPA Gatekeeper:
+no latest tag constraint
+Kyverno:
+require resource limits
+disallow privileged workloads
+42. SLO
+Sloth PrometheusServiceLevel object:
+99.9% availability SLO
+for:
+api-service
+The SLO resource was created/applied.
+Sloth controller processing itself was not fully verified.
+43. CHAOS
+A Litmus ChaosEngine pod-delete experiment was:
+created
+applied
+But completion was not fully verified.
+44. GITOPS CI/CD
+Pipeline included:
+Security
+TruffleHog
+tfsec
+Manifest validation
+kubectl dry-run
+Terraform validation
+terraform fmt
+terraform init
+terraform validate
+Drift/configuration check
+Checks included:
+annotations
+security contexts
+resource limits
+SLO definitions
+chaos experiments
+All pipeline checks were confirmed green.
+45. GITOPS INCIDENTS
+ComparisonError
+An Argo CD ComparisonError occurred.
+It was fixed.
+Drift screenshot problem
+The drift correction occurred too quickly to capture in a screenshot.
+The behavior itself was considered the stronger evidence.
+Argo CLI connection
+Argo CD CLI lost connection because of the port-forward lifecycle.
+46. GITOPS GAPS
+canary not actually triggered/fully verified
+Image Updater not installed
+External Secrets not configured
+single cluster
+Sloth controller processing not verified
+Litmus experiment completion not verified
+47. GITOPS DOCUMENTATION
+Documentation included:
+ARCHITECTURE.md
+GITOPS_MODEL.md
+SECURITY.md
+ADR.md
+INCIDENTS.md
+GAPS.md
+Repository structure included:
+terraform/main.tf
+argocd-values.yaml
+apps/base
+apps/staging
+apps/production
+argocd/projects/platform-project.yaml
+argocd/appsets/platform-appset.yaml
+security/opa/no-latest-tag.yaml
+security/kyverno/require-resources.yaml
+observability/sloth/api-service-slo.yaml
+chaos/litmus/pod-kill-experiment.yaml
+.github/workflows/gitops.yml
+48. FORGE — INTERNAL DEVELOPER PLATFORM
+Classification
+Major Platform Engineering Project
+Not:
+Engineering Lab
+professional production experience
+Platform:
+Google Kubernetes Engine Autopilot
+49. FORGE ARCHITECTURE
+Forge is a self-service Internal Developer Platform.
+Core flow:
+Backstage → GitLab CI/CD → Artifact Registry → Argo CD → Argo Rollouts → GKE
+Security/policy:
+Kyverno
+Workload Identity Federation
+immutable Artifact Registry tags
+Observability/reliability:
+Kubernetes-level SLOs
+Grafana
+rollout health
+Cost:
+per-namespace attribution
+50. FORGE DEVELOPER WORKFLOW
+Intended workflow:
+Developer scaffolds service from Backstage.
+GitLab CI runs tests/scans/build.
+Image is pushed to Artifact Registry.
+Artifact uses immutable tagging.
+Argo CD reconciles desired state.
+Unauthorized cluster changes are reverted.
+Argo Rollouts performs gradual delivery.
+Kyverno enforces policy.
+Kubernetes-level SLOs provide platform health signals.
+Namespace-level cost attribution provides cost visibility.
+51. FORGE VERIFIED RESULTS
+Verified:
+core platform deployed
+Backstage portal demonstrated
+GitOps drift correction demonstrated live
+Argo Rollouts canary delivery
+failing canary automatically aborted
+zero manual intervention required for that abort
+Kyverno admission-time policy enforcement
+zero-stored-credential CI/CD
+Workload Identity Federation
+immutable Artifact Registry tags
+52. FORGE LIMITATIONS
+Not verified / not complete:
+no real production workload
+no real user traffic
+no real engineering organization consuming the platform
+no application-level metrics for Backstage
+only Kubernetes-level health was available for Backstage
+Backstage golden-path template stops at local generation
+no end-to-end repository publication from the template
+Grafana dashboard rendering configured but unverified
+Slack delivery configured but unverified
+no NetworkPolicies
+no image signing
+no SBOM
+Therefore:
+Forge is a serious platform engineering project, but it must not be presented as an IDP used by real production engineers/customers.
+53. ATLAS — DISTRIBUTED RESILIENCE PLATFORM
+Classification
+Flagship Engineering System — GCP
+One of the strongest portfolio projects.
+It is not professional production infrastructure.
+It is a production-shaped / production-modeled distributed workload execution platform.
+54. ATLAS CORE PROBLEM
+Client submits work containing:
+resource requirements
+priority
+retry policy
+System flow:
+Client → API → queue → scheduler → workers → result
+The scheduler performs capacity-aware placement.
+55. ATLAS SCOPE
+All:
+18 planned phases
+were:
+implemented
+deployed
+verified
+This project is not an AI/ML/GPU platform.
+Its primary engineering focus is:
+distributed systems
+scheduling
+reliability
+SRE
+cloud infrastructure
+GitOps
+observability
+failure recovery
+multi-region resilience
+FinOps
+56. ATLAS SCHEDULER
+Scheduler type:
+capacity-based bin-packing
+It is not simple round-robin scheduling.
+The scheduler considers resource capacity and workload requirements.
+57. ATLAS MAJOR BUG DISCOVERED
+During testing, a genuine:
+scheduler capacity-accounting race condition
+was discovered.
+The problem was not merely theoretical.
+Concurrent scheduling could produce an incorrect capacity view because reservation/accounting was not sufficiently atomic.
+The issue was:
+reproduced
+root-caused
+fixed
+Fix:
+atomic reservation
+The system was then re-tested.
+This is a major interview-grade piece of evidence because the user found a distributed-systems correctness issue through actual testing rather than designing a system that only worked under ideal conditions.
+58. ATLAS TERRAFORM / IDENTITY
+Implemented:
+Terraform across environments
+Terraform remote state
+keyless service-account impersonation
+Organization policy:
+blocks static credentials
+Static credentials were not used.
+This provides stronger evidence than simply saying “secrets were stored securely.”
+59. ATLAS GKE SECURITY / GOVERNANCE
+Implemented:
+namespace RBAC
+Workload Identity
+separation of node/pod identity
+PodDisruptionBudgets
+resource governance
+allocatable-capacity-based scheduling
+NetworkPolicy
+RBAC least privilege was tested using authorization checks.
+60. ATLAS GITOPS DRIFT TEST
+A deliberate unauthorized change was made:
+kubectl scale ...
+Argo CD detected and reconciled the unauthorized change.
+Measured correction:
+under 3 seconds
+This is separate from the GitOps Engineering Lab result of:
+under 2 seconds
+Both numbers must remain because they refer to different systems/tests.
+61. ATLAS CI/CD
+GitLab CI/CD operated against a GitHub repository.
+Pipeline included:
+tests
+lint
+SAST
+dependency scanning
+IaC scanning
+build
+image scanning
+keyless Artifact Registry push
+GitLab → GCP Workload Identity Federation
+automatic GitOps deployment after merge
+Deployment required:
+no manual kubectl/helm
+after the automated pipeline flow.
+62. ATLAS SUPPLY CHAIN
+Identity model:
+keyless
+Artifact destination:
+Google Artifact Registry
+Authentication:
+GitLab → GCP WIF
+No long-lived cloud credentials were stored for deployment.
+63. ATLAS OBSERVABILITY
+Implemented:
+Google Managed Prometheus
+Grafana
+OpenTelemetry
+distributed tracing
+Redis trace-context propagation
+Trace path:
+API → queue → scheduler → worker
+This allows a request to be followed through the distributed workload path rather than only observing isolated services.
+64. ATLAS SLO / ERROR-BUDGET METHODOLOGY
+SLOs and error budgets were based on:
+real measured baselines
+The project explicitly excluded contaminated data from the baseline.
+This mattered because a malformed-input worker bug was discovered.
+65. ATLAS MALFORMED-INPUT BUG
+A malformed-input condition caused worker failure.
+The issue was:
+observed
+investigated
+fixed
+The SLO/baseline process did not simply hide the failure.
+Instead, contaminated data was identified and excluded where appropriate.
+This is evidence of disciplined measurement rather than manipulating numbers to make the system appear healthy.
+66. ATLAS PROGRESSIVE DELIVERY
+Argo Rollouts was used.
+A broken deployment was introduced.
+Rollback was driven by:
+health signals
+SLO signals
+Automated rollback occurred.
+The system was tested using actual failure conditions rather than only demonstrating a successful canary.
+67. ATLAS FAILURE TESTING
+Failure testing included:
+worker failures
+node failures
+bad deployments
+scheduling correctness problems
+controlled regional failure
+GitOps drift
+malformed workload inputs
+Chaos experiments were documented around:
+hypothesis
+blast radius
+outcome
+A live-system chaos experiment was recorded/documented.
+68. ATLAS NODE / DRAIN ISSUES
+An incident involving:
+node-drain stalls
+was encountered.
+This became part of the project's incident/debugging evidence.
+69. ATLAS IMAGE-PULL INCIDENT
+An:
+image-pull authentication gap
+was encountered.
+It was investigated and addressed.
+This demonstrates that the supply chain was tested as an operational system rather than merely configured.
+70. ATLAS MULTI-REGION
+Architecture:
+active/active multi-region
+Controlled failover was performed.
+RTO/RPO were:
+measured
+rather than estimated.
+The project also explicitly documented the cross-region queue decision.
+71. ATLAS FAILURE MODEL
+Explicitly excluded:
+simultaneous total region failure
+GCP control-plane outage
+Byzantine workers
+distributed database
+The project uses managed GCP primitives for workload state.
+These exclusions are important because “multi-region resilient” should not be interpreted as “survives every conceivable failure.”
+72. ATLAS SECURITY
+Security controls included:
+least-privilege IAM
+auth can-i verification
+Workload Identity
+RBAC
+NetworkPolicy
+image scanning
+dependency scanning
+IaC scanning
+policy-as-code admission control
+threat modeling
+73. ATLAS FINOPS
+Cost engineering included:
+namespace attribution
+workload attribution
+fixed-capacity vs autoscaled-capacity comparison
+GCP billing data where available
+Infrastructure was torn down between sessions to prevent unnecessary cloud spend.
+Budget alerts were configured/documented.
+74. ATLAS OPERATOR
+Separate add-on to Atlas.
+Technologies:
+Flutter Android application
+Python 3.12
+FastAPI
+Purpose:
+Operations interface for the Atlas platform.
+75. ATLAS OPERATOR LIVE VERIFICATION
+Verification date:
+2026-09-20
+Tested on:
+real Android phone
+real cluster/backend
+Connection banner called:
+/health
+/ready
+Observed sequence:
+Healthy → Failed → Healthy
+The failure state was induced by scaling the backend to:
+0
+Then the backend was restored to:
+1
+and the application returned to Healthy.
+76. ATLAS OPERATOR BUG
+Initial real-device attempt failed because the Android application lacked:
+INTERNET permission
+The issue was identified and fixed.
+This is a real device integration bug and should remain in the engineering history.
+77. ATLAS OPERATOR QUALITY CHECKS
+Verified:
+flutter analyze clean
+24 tests pass
+CI passes on a self-hosted GitLab runner
+78. ATLAS OPERATOR LIMITATIONS
+Not live / not production:
+all screens except connection banner use fixture data
+no authentication
+temporary external exposure was torn down
+app cannot perform Terraform apply
+app cannot perform Terraform destroy
+Therefore it must not be represented as a production operations console.
+79. ENTERPRISE CLOUD PLATFORM / VELRITE
+Classification
+Flagship Engineering System — AWS
+Repository:
+velrite/enterprise-cloud-platform
+Application:
+velrite/bank-of-anthos
+The application is a fork of:
+Google Bank of Anthos
+80. PROJECT MODEL
+The project models a:
+mid-sized regulated digital bank
+This is a simulation / production-modeling context.
+It is not:
+an actual bank
+an actual banking employer
+real banking production
+real money
+real regulator infrastructure
+real customer traffic
+The banking model is used to justify serious controls around:
+supply-chain security
+service mesh
+secrets
+runtime security
+observability
+reliability
+deployment safety
+The project explicitly avoids claiming global-bank scale.
+81. BUILD METHOD
+The project was built:
+alone
+from scratch
+in one repository
+as one continuous build
+Same:
+codebase
+cluster
+infrastructure
+was maintained across phases.
+Later phases added to the already-running system rather than rebuilding separate toy environments for every feature.
+An earlier Internal Developer Platform/custom CLI phase was deliberately removed because it had the:
+lowest signal-to-effort ratio
+and would have introduced fragile dependencies.
+The final roadmap excludes that component.
+82. ENTERPRISE PLATFORM PROBLEM
+The engineering problem:
+A team needs to ship code frequently to customer-facing banking services without:
+vulnerable images
+tampered images
+unplanned downtime
+blind incident diagnosis
+The important question is not merely:
+“Can we deploy?”
+It is:
+Can we deploy safely?
+Can we prove the artifact matches intent?
+Can we immediately detect problems?
+Can we diagnose failures through telemetry rather than guessing?
+83. ENTERPRISE PLATFORM PHASE HISTORY
+There are two status snapshots in the source information.
+This distinction must be preserved.
+Earlier README snapshot
+At that point:
+Phase 1 — complete
+Phase 2 — complete
+Phase 3 — not built
+Phase 4 — AI/GPU not built
+Phase 5 — FinOps not built
+Later roadmap state
+Later roadmap states:
+Phase 1 — complete
+Phase 2 — complete
+Phase 3 — complete: resilience, chaos engineering, DR
+Phase 4 — complete: FinOps & cloud cost intelligence
+Therefore these are historical states, not necessarily contradictory statements.
+The earlier README represents an earlier repository/project state.
+The later roadmap represents a later claimed state.
+84. ENTERPRISE PLATFORM PHASE 1
+Phase 1:
+Kubernetes Platform Foundation
+Components:
+EKS
+VPC
+networking
+node groups
+Terraform
+base RBAC
+IAM
+IRSA/OIDC
+85. EKS FOUNDATION
+Infrastructure:
+EKS cluster
+VPC
+public subnets
+private subnets
+NAT gateway
+route tables
+node groups
+cluster autoscaler
+IAM
+OIDC / IRSA
+Namespaces:
+platform
+apps
+monitoring
+security
+Additional namespaces were introduced by later phases.
+86. TERRAFORM STATE
+Roadmap intent:
+remote Terraform state
+S3 backend
+DynamoDB locking
+no local state
+This was part of the production-shaped infrastructure approach.
+87. BASE SECURITY
+Implemented / intended:
+least-privilege RBAC
+no default cluster-admin usage
+Kubernetes authorization testing
+network-policy default posture
+IRSA/OIDC
+Evidence checks included:
+kubectl auth can-i
+88. FOUNDATION TESTING
+Required / demonstrated engineering tests included:
+Terraform plan/apply from clean state
+node draining/recovery
+RBAC authorization checks
+reproducibility from infrastructure code
+The phase's core question:
+Can real production-shaped Kubernetes infrastructure be provisioned reproducibly as code rather than manually?
+89. ENTERPRISE PLATFORM PHASE 2
+Phase 2:
+Enterprise Cloud Platform — CI/CD Supply Chain, Security & Observability
+90. SUPPLY-CHAIN PIPELINE
+Pipeline architecture:
+Build → Scan → Sign → Gate → Deploy
+Tools:
+GitHub Actions
+Gitleaks
+Trivy
+Syft
+Cosign
+OPA/Conftest
+All major pipeline gates were verified green end-to-end in the relevant snapshot.
+91. TRIVY
+Used for:
+container scanning
+dependency scanning
+92. SYFT
+Used for:
+SBOM generation
+93. COSIGN
+Used for:
+image signing
+Important distinction:
+Cosign signatures were verified in the pipeline.
+However, in the original verified snapshot:
+cluster admission enforcement of Cosign signatures was not confirmed.
+Therefore the correct claim is:
+Image signing and pipeline verification were implemented.
+Not:
+Every unsigned image was proven impossible to deploy.
+The later roadmap considered admission-enforced signature verification, for example through Kyverno verifyImages.
+94. OPA / CONFTEST
+OPA/Conftest was used for policy checks in the software supply chain.
+95. GITLEAKS
+Gitleaks was used to detect credentials/secrets entering the repository/pipeline.
+96. ARGO CD / ARGO ROLLOUTS
+GitOps:
+Argo CD
+Progressive delivery:
+Argo Rollouts
+Canary deployment was implemented.
+Automatic rollback fired for a real failure once in the verified project evidence.
+This must not be described as merely theoretical.
+97. ISTIO
+Istio was implemented for:
+service mesh
+mTLS
+traffic policy
+fault injection
+Fault injection was:
+proven with real timing
+mTLS configuration:
+PeerAuthentication: STRICT
+Important limitation:
+Live mTLS enforcement could not be confirmed through the expected Prometheus telemetry because:
+istio_requests_total
+was absent at the relevant test time.
+Therefore:
+STRICT mTLS was configured, but live enforcement telemetry was not fully confirmed.
+98. ISTIO CIRCUIT BREAKING
+Circuit-breaker / outlier-detection behavior was configured.
+However:
+it was never observed firing under real traffic.
+Therefore it must be described as configured, not experimentally proven.
+99. VAULT
+Vault was implemented.
+Mode:
+development mode
+Important limitation:
+Vault dev mode is not durable production-grade Vault.
+Production-grade future direction:
+HA Vault
+durable storage backend
+real unseal process
+100. KYVERNO
+Kyverno was used for security policy enforcement.
+The project also used:
+OPA/Gatekeeper-style controls
+admission policies
+resource/security posture
+RBAC and NetworkPolicy enforcement were independently verified live.
+101. FALCO
+Falco was implemented for:
+runtime threat detection
+This provided runtime security beyond static image scanning.
+102. KUBE-BENCH
+kube-bench was used for:
+CIS Kubernetes benchmark
+The roadmap intended before/after hardening comparison.
+103. OBSERVABILITY STACK
+Implemented:
+Prometheus
+Grafana
+Loki
+Tempo
+OpenTelemetry
+Alertmanager
+Dashboards were designed around:
+Golden Signals
+RED
+USE
+SLOs and error budgets were explicitly defined.
+104. EBS CSI INCIDENT
+Loki / Tempo / OpenTelemetry initially encountered an undocumented dependency related to the:
+EBS CSI driver
+The driver had to be installed before those components could operate correctly.
+This belongs in the incident/debugging history.
+105. ENTERPRISE PLATFORM REAL INCIDENT COUNT
+The project documentation contained:
+13 real incidents
+These are recorded in:
+docs/incidents/
+This is important portfolio evidence.
+The project was not developed without operational failures.
+106. ENTERPRISE REPOSITORY STRUCTURE
+Important directories:
+Terraform
+terraform/
+Includes:
+network
+cluster
+bootstrap state
+Kubernetes baseline
+k8s/baseline/
+Includes:
+namespaces
+default-deny NetworkPolicy
+baseline RBAC
+Helm
+helm-values/
+Contains exact Helm values used for installations.
+Architecture
+docs/architecture/
+Contains:
+system design
+ADRs
+security architecture
+Operations
+docs/operations/
+Contains:
+runbooks
+deployment flow
+cost analysis
+load testing
+Reliability
+docs/reliability/
+Contains:
+SLOs
+failure-mode results
+real drain/PDB tests
+Security
+docs/security/
+Contains:
+security controls matrix
+supply-chain details
+Incidents
+docs/incidents/
+Contains:
+full postmortem log
+13 real incidents
+Engineering
+docs/engineering/
+Contains:
+debugging history
+lessons learned
+technical debt
+Screenshots
+docs/SCREENSHOTS.md
+Contains the exact evidence screenshots still required.
+107. ENTERPRISE RUNBOOK
+Full bring-up order was documented.
+A recurring:
+WSL2 DNS problem
+broke almost every cluster-start session.
+This was documented in:
+docs/operations/runbook.md
+under:
+“Rebuilding the Cluster From Zero.”
+This is a useful operational detail because it demonstrates environment reproducibility work rather than pretending every cluster boot was frictionless.
+108. ENTERPRISE SECURITY / SUPPLY-CHAIN STATUS
+The relevant stack included:
+Terraform
+EKS
+VPC
+NAT
+IAM
+IRSA/OIDC
+GitHub Actions
+Gitleaks
+Trivy
+Syft
+Cosign
+OPA/Conftest
+Argo CD
+Argo Rollouts
+Istio
+Vault
+Kyverno
+Falco
+kube-bench
+The pipeline gates were verified green.
+109. ENTERPRISE OBSERVABILITY STATUS
+Prometheus/Grafana APIs were verified.
+Loki/Tempo/OpenTelemetry were implemented.
+The EBS CSI issue had to be resolved for some observability components.
+OpenTelemetry was part of the tracing architecture.
+Alertmanager was included.
+110. ENTERPRISE GITOPS RESULT
+Argo Rollouts automatic rollback:
+fired for real once
+This must remain distinct from merely configuring rollback.
+111. ENTERPRISE ISTIO FAILURE-INJECTION RESULT
+Fault injection:
+verified with real timing
+This means traffic behavior was actually observed rather than inferred from YAML.
+112. ENTERPRISE RBAC / NETWORKPOLICY RESULTS
+RBAC boundary was:
+independently verified live
+NetworkPolicy enforcement was:
+independently verified live
+113. ENTERPRISE EARLIER SNAPSHOT — PHASE 3
+The original README at the earlier point explicitly said:
+Phase 3 — Chaos Engineering & Disaster Recovery: not yet built
+Planned:
+Chaos Mesh / Litmus
+HA PostgreSQL failover
+Velero backup/restore
+Planned chaos experiments included:
+kill nodes
+kill pods
+break networking
+fill disks
+expire certificates
+simulate region failure
+114. ENTERPRISE LATER PHASE 3 ROADMAP
+Later roadmap says Phase 3 became:
+complete — resilience, chaos engineering and disaster recovery
+Planned/implemented architecture included:
+Chaos
+Chaos Mesh or LitmusChaos
+node failures
+pod failures
+networking failures
+disk pressure
+certificate expiration
+regional failure
+PostgreSQL
+replication
+automated failover
+Patroni or equivalent
+Redis
+Redis Sentinel
+etcd
+etcd cluster
+Recovery
+Velero
+full cluster restore
+namespace restore
+PV restore
+DB restore
+Required demonstrations
+six chaos experiments
+timed full restore
+live DB failover
+identify what self-healed
+identify what required human intervention
+Important:
+The supplied historical material does not provide every final Phase 3 measured result. Therefore exact RTOs, failover seconds, restore seconds, or individual chaos outcomes must not be invented.
+The status is:
+Later roadmap says complete; detailed final evidence needs the actual phase documentation before numerical claims are made.
+115. ENTERPRISE FINOPS HISTORY
+Earlier README:
+FinOps was:
+not built
+Cost analysis at that stage used:
+raw AWS CLI
+rather than a full OpenCost/Kubecost system.
+116. LATER ENTERPRISE FINOPS STATUS
+Later roadmap says:
+Phase 4 — FinOps & Cloud Cost Intelligence: complete
+Potential scope in roadmap included:
+OpenCost/Kubecost
+waste detection
+forecasting
+cloud cost intelligence
+However, exact final metrics were not supplied in the recovered information.
+Therefore do not invent:
+percentage savings
+dollar savings
+forecast accuracy
+OpenCost deployment status
+exact waste identified
+The master record must say:
+Roadmap status: complete. Detailed final evidence not included in supplied source material.
+117. ENTERPRISE AI/GPU PHASE
+Earlier project roadmap included:
+Phase 4 — AI Infrastructure
+Planned:
+GPU scheduling
+model serving
+This was explicitly not built in the earlier README snapshot.
+This is separate from the later roadmap where Phase 4 became FinOps.
+Therefore chronology must remain explicit.
+118. ENTERPRISE COST / OPERATIONAL LIMITATIONS
+The project includes cost analysis.
+The environment is not described as an always-on production banking environment.
+The user documented cost-related operational behavior and infrastructure teardown where relevant.
+The project is intentionally production-shaped rather than a real banking deployment.
+119. ENTERPRISE TECHNICAL DEBT
+Source of truth:
+docs/engineering/technical-debt.md
+The README explicitly says the project is:
+not promotional
+and documents:
+what was built
+what was tested
+what broke
+what remains unverified
+This is a central principle of the portfolio.
+120. PRODUCTION-ORIENTED AI INFERENCE PLATFORM
+Classification
+Advanced Independent Engineering Project
+Not:
+Engineering Lab
+production employment
+successful GPU deployment
+
+121. AI PLATFORM MODEL
+Platform:
+GKE
+Model:
+Qwen2.5-1.5B-Instruct
+Primary objective:
+Operate model inference infrastructure with production-oriented concerns around:
+deployment
+security
+supply chain
+admission control
+networking
+GitOps
+reliability
+cost
+This is infrastructure/platform engineering, not AI/ML research.
+122. AI SUPPLY CHAIN
+Implemented:
+signed software supply chain
+image signing
+verification
+admission control
+GitOps
+security scanning
+network segmentation
+A particularly important result:
+The supply chain was proven in both directions:
+valid/signed artifact accepted
+unverified artifact rejected
+Every claimed control was intended to have a live test.
+123. GPU QUOTA BLOCKER
+GPU provisioning was blocked by GCP account-level quota:
+GPUS_ALL_REGIONS=0.0
+This was confirmed through direct instance-group error logs.
+The user did not simply assume the GPU failed.
+Testing was performed across:
+GPU types
+regions
+fresh project
+under the same billing account.
+The quota remained:
+0.0
+124. AI CPU FALLBACK
+Because GPU provisioning was unavailable, the entire platform was validated using:
+CPU inference
+The following were still tested:
+live inference
+real inference responses
+load testing
+pod-failure recovery
+rollback
+Terraform reproducibility
+signed supply chain
+CI/CD
+security controls
+The platform therefore has meaningful infrastructure evidence despite the GPU quota limitation.
+125. AI PLATFORM DOCUMENTATION
+Documentation included:
+architecture
+security / supply chain
+delivery pipeline
+reliability evidence
+GPU constraint
+cost considerations
+Teardown / cost safeguards were documented.
+126. AI PLATFORM CLAIM BOUNDARY
+Correct:
+Production-oriented inference platform validated on CPU because GPU quota was unavailable.
+Incorrect:
+Successfully deployed a GPU inference cluster.
+Incorrect:
+Operated GPU model serving in production.
+The strongest story is:
+engineering under an externally imposed infrastructure constraint.
+127. CROSS-PROJECT SECURITY THEMES
+Security work across the portfolio includes:
+zero static credentials
+Workload Identity
+WIF
+IRSA/OIDC
+service-account impersonation
+Vault
+dynamic credentials
+secret rotation
+Gitleaks
+TruffleHog
+Trivy
+Syft
+Cosign
+Kyverno
+OPA
+OPA Gatekeeper
+Conftest
+Falco
+kube-bench
+RBAC
+NetworkPolicy
+default-deny policies
+admission control
+immutable image tags
+GitOps
+software supply-chain validation
+128. CROSS-PROJECT RELIABILITY THEMES
+Reliability evidence includes:
+node failure recovery
+pod failure
+bad deployment rollback
+HPA scaling
+GitOps drift correction
+automated canary rollback
+scheduler race-condition discovery
+atomic reservation
+malformed-input bug discovery
+node drain issues
+image-pull authentication issues
+multi-region active/active
+measured RTO/RPO
+chaos experiments
+SLOs
+error budgets
+PDBs
+resource governance
+capacity-aware scheduling
+129. CROSS-PROJECT OBSERVABILITY THEMES
+Tools and methods:
+Prometheus
+Grafana
+Alertmanager
+Loki
+Tempo
+OpenTelemetry
+Google Managed Prometheus
+Golden Signals
+RED
+USE
+SLOs
+error budgets
+distributed tracing
+Redis trace-context propagation
+The user has demonstrated an important distinction between:
+having an observability configuration
+and:
+actually receiving/verifying useful telemetry.
+Examples:
+Auto-Healing Golden Signals dashboard: only Saturation had real data.
+Istio STRICT mTLS: configured, but telemetry did not confirm live enforcement.
+Atlas tracing: actual API→queue→scheduler→worker tracing was implemented.
+SLO baselines: contaminated data was explicitly excluded.
+130. CROSS-PROJECT GITOPS THEMES
+GitOps systems:
+Argo CD
+Argo Rollouts
+Kustomize
+ApplicationSets
+sync waves
+Evidence:
+drift correction under 2 seconds in GitOps Lab
+drift correction under 3 seconds in Atlas
+automated rollback
+canary progression
+production/staging access boundaries
+no manual kubectl/helm required in Atlas's automated deployment path
+131. CROSS-PROJECT FINOPS THEMES
+FinOps evidence includes:
+Auto-Healing
+OpenCost
+real API JSON
+cost labels
+UI verification
+local infrastructure cost of $0
+Atlas
+namespace/workload attribution
+fixed vs autoscaled comparison
+GCP billing data where available
+budget controls
+teardown between sessions
+Enterprise AWS
+raw AWS CLI cost analysis in earlier snapshot
+later roadmap claims completed FinOps/cloud-cost intelligence phase
+exact final metrics not supplied
+132. IMPORTANT INCIDENTS ACROSS PORTFOLIO
+Known actual incidents / engineering failures include:
+Auto-Healing
+missing docker-proxy
+memory exhaustion
+Kubecost failure
+HPA unknown metrics
+Git history credential contamination
+Terraform Lab
+hardcoded Grafana password
+terminal paste corruption
+Terraform apply showing 0 resources
+GitOps Lab
+Argo ComparisonError
+port-forward / Argo CLI connection loss
+drift happened too quickly for screenshot
+canary not fully verified
+Litmus completion not verified
+Atlas
+scheduler capacity race
+node-drain stall
+image-pull authentication gap
+malformed worker input
+controlled failure experiments
+backend health transitions in Operator
+Android INTERNET permission failure
+Enterprise AWS
+13 documented real incidents
+WSL2 DNS
+EBS CSI dependency issue
+observability startup/dependency problems
+real rollback event
+Istio telemetry limitation
+mTLS verification limitation
+AI platform
+GPU quota GPUS_ALL_REGIONS=0.0
+These failures should be preserved because they demonstrate engineering debugging rather than only successful demos.
+
+
+133. WHAT THE USER HAS DELIBERATELY REFUSED TO CLAIM
+The user has explicitly rejected:
+invented metrics
+fake production experience
+fake customers
+fake users
+fake team sizes
+fake revenue
+fake incidents
+fake certifications
+fake responsibilities
+fake seniority
+fake production traffic
+false GPU success
+false banking production
+false production IDP usage
+This constraint applies to all future career materials.
+134. PROJECT CLAIM BOUNDARIES
+Auto-Healing
+Can claim:
+tested Kubernetes reliability lab
+20-second node recovery
+32-second rollback
+0 blast radius
+2→8 HPA scaling
+86% CPU
+scale-down to 2 at 2% CPU
+48-second CI pipeline
+dynamic Vault credentials
+zero-downtime KV rotation
+OpenCost verification
+Cannot claim:
+production Kubernetes
+complete application observability
+image signing
+PDB
+NetworkPolicy
+production Vault
+Terraform Lab
+Can claim:
+Terraform-managed Kubernetes platform
+13 resources
+modular IaC
+security scanning
+credential incident and remediation
+reproducibility model
+Cannot claim:
+remote-state production Terraform
+Terraform-managed HPA
+production infrastructure
+GitOps Lab
+Can claim:
+Argo CD
+GitOps
+drift correction under 2 seconds
+RBAC boundaries
+ApplicationSet
+sync waves
+policy-as-code
+99.9% SLO resource
+CI validation
+Cannot claim:
+verified canary runtime in that lab
+verified Litmus experiment completion
+multi-cluster production GitOps
+Forge
+Can claim:
+GKE Autopilot IDP
+Backstage
+GitLab
+Argo CD
+Argo Rollouts
+Kyverno
+WIF
+immutable artifacts
+automated canary abort
+drift correction
+Cannot claim:
+production IDP
+real engineering users
+real production traffic
+end-to-end Backstage repository creation
+signed images
+SBOM
+NetworkPolicy
+Atlas
+Can claim:
+distributed workload platform
+bin-packing scheduler
+atomic reservation race fix
+GitOps
+under-3-second drift correction
+WIF/keyless identity
+OpenTelemetry distributed tracing
+measured SLOs
+automated rollback
+active/active multi-region
+measured RTO/RPO
+chaos experiments
+FinOps
+Cannot claim:
+professional production infrastructure
+Byzantine fault tolerance
+total-region simultaneous failure protection
+GCP control-plane outage protection
+distributed database architecture
+Atlas Operator
+Can claim:
+Flutter Android app
+FastAPI operations API
+real-device verification
+Healthy→Failed→Healthy test
+INTERNET permission bug fixed
+24 tests
+clean Flutter analysis
+CI on self-hosted GitLab runner
+Cannot claim:
+production operator console
+complete live UI
+authentication
+Terraform lifecycle control
+Enterprise AWS
+Can claim:
+EKS
+Terraform
+secure supply chain
+GitHub Actions
+Trivy
+Syft
+Cosign
+Gitleaks
+OPA/Conftest
+Argo CD
+Argo Rollouts
+Istio
+Vault
+Kyverno
+Falco
+kube-bench
+Prometheus/Grafana/Loki/Tempo/OTel/Alertmanager
+real rollback
+real fault injection timing
+live RBAC / NetworkPolicy verification
+13 documented incidents
+later roadmap phases as explicitly qualified
+Cannot claim:
+actual banking production
+real money
+real regulator
+real customers
+global bank scale
+fully verified live mTLS telemetry
+observed circuit breaking
+admission-enforced Cosign unless later evidence explicitly proves it
+exact final Phase 3/4 metrics without source evidence
+AI platform
+Can claim:
+GKE inference platform
+Qwen2.5-1.5B-Instruct
+signed supply chain
+admission rejection of unverified images
+CPU inference validation
+load testing
+rollback
+pod failure recovery
+Terraform reproducibility
+GPU quota investigation
+Cannot claim:
+successful GPU provisioning
+GPU production inference
+GPU quota availability
+135. PERSONAL WEBSITE / PORTFOLIO
+The user has a personal website.
+Potential evidence to expose:
+project architecture
+architecture diagrams
+measured results
+incidents
+SLOs
+failure experiments
+technical debt
+GitHub repositories
+cloud links
+AWS/GCP live project evidence where genuinely available
+The user considered adding free-tier AWS and GCP live project links to prove cloud work.
+Important:
+Do not claim the website itself is hosted on AWS/GCP unless that is actually true.
+136. LINKEDIN
+The user had approximately:
+400 connections
+as of July 2026.
+Goal:
+Generate:
+interviews
+contracts
+engineering relationships
+The user dislikes:
+desperate language
+generic AI-sounding writing
+fake authority
+“I follow your work”
+generic “I noticed you work at X”
+empty engagement
+Connection notes should be:
+under 200 characters
+The user uses a normal/non-Premium account and previously encountered a temporary inability to send notes.
+
+136. LINKEDIN
+The user had approximately:
+400 connections
+as of July 2026.
+Goal:
+Generate:
+interviews
+contracts
+engineering relationships
+The user dislikes:
+desperate language
+generic AI-sounding writing
+fake authority
+“I follow your work”
+generic “I noticed you work at X”
+empty engagement
+Connection notes should be:
+under 200 characters
+The user uses a normal/non-Premium account and previously encountered a temporary inability to send notes.
+137. LINKEDIN TARGET AUDIENCE
+Primary:
+CTOs
+VPs of Engineering
+Heads of Infrastructure
+Principal Engineers
+Staff Engineers
+Platform Engineering leaders
+138. LINKEDIN COMMENT STRATEGY
+Preferred high-signal technical posts include:
+Kubernetes failure analysis
+bare-metal Kubernetes
+AI infrastructure
+PgBouncer connection exhaustion
+PDB / HA
+n8n Kubernetes root-cause analysis
+SRE incidents
+cloud reliability
+supply-chain security
+FinOps
+infrastructure failures
+The goal of comments is not visibility for its own sake.
+The comment should demonstrate:
+operational reasoning
+failure-mode thinking
+root-cause analysis
+tradeoffs
+practical engineering experience
+The user previously wanted:
+6 powerful comments
+rather than generic comments.
+139. CONTENT / VIDEO STRATEGY
+The user wanted content similar in concept to “Code Cloud”:
+technical infrastructure topics
+free AI design tools
+CapCut-style explanatory videos
+visually understandable engineering concepts
+A previous content brainstorming request sought:
+80 topics
+Potential topic families include:
+Kubernetes failure modes
+SLOs
+GitOps
+cloud cost
+security
+observability
+distributed systems
+chaos engineering
+supply-chain security
+reliability engineering
+production incidents
+140. USER'S PROFESSIONAL BRAND THEMES
+Strongest themes:
+Failure-first infrastructure
+Infrastructure should be designed for failure rather than surprised by it.
+Recovery
+Recovery without human intervention wherever architecture permits.
+Security
+Zero static credentials and verified supply chains.
+Observability
+Don't guess during incidents; use telemetry.
+Cost
+Understand cost at workload/service level.
+Systems thinking
+Mechatronics background informs failure-oriented system design.
+141. ENGINEERING COMMUNICATION PRINCIPLES
+The user wants technical writing to:
+be precise
+show actual evidence
+identify limitations
+explain decisions
+show incidents
+show fixes
+show verification
+avoid marketing language
+avoid unsupported claims
+The user's repositories are intentionally documentation-heavy.
+Technical debt documentation is considered a strength when it demonstrates intellectual honesty.
+142. INTERVIEW-CRITICAL TECHNICAL TOPICS
+The user should be prepared to defend:
+Kubernetes
+HPA
+PDB
+NetworkPolicy
+cluster autoscaling
+node drain
+pod disruption
+scheduling
+resource requests/limits
+allocatable capacity
+GitOps
+Argo CD
+drift
+reconciliation
+sync waves
+ApplicationSets
+Rollouts
+canary
+rollback
+Security
+Vault
+dynamic credentials
+WIF
+IRSA/OIDC
+Cosign
+image verification
+Kyverno
+RBAC
+NetworkPolicy
+Falco
+supply-chain threat model
+Service mesh
+Istio
+mTLS
+fault injection
+retries
+circuit breakers
+outlier detection
+retry storms
+Observability
+Prometheus
+Grafana
+Loki
+Tempo
+OpenTelemetry
+Golden Signals
+RED
+USE
+SLOs
+error budgets
+Distributed systems
+scheduler consistency
+atomic reservation
+queues
+retries
+idempotency
+capacity
+regional failure
+RTO
+RPO
+multi-region architecture
+FinOps
+workload attribution
+fixed vs autoscaled cost
+resource utilization
+waste
+budgets
+143. SPECIFIC INTERVIEW QUESTIONS THE PORTFOLIO SHOULD SUPPORT
+Likely questions:
+Why Kubernetes?
+Why EKS rather than another deployment model?
+Why GKE?
+Why Istio?
+Why Vault?
+Why Argo CD?
+Why Argo Rollouts?
+What exactly happened during the scheduler race condition?
+Why did atomic reservation fix it?
+What happens during Redis failure?
+How is Redis trace context propagated?
+What happens when a node drains?
+What does a PDB protect?
+What does a PDB not protect?
+How does HPA interact with cluster capacity?
+What happens if the cluster cannot schedule the additional pods?
+How does cluster autoscaler interact with HPA?
+What was the blast radius of the bad deployment?
+How was the 32-second rollback measured?
+Why was the Auto-Healing Golden Signals dashboard incomplete?
+Why did istio_requests_total not appear?
+How would you prove STRICT mTLS actually works?
+Why isn't a configured circuit breaker equivalent to a verified circuit breaker?
+What attack does Kyverno prevent?
+What happens if Kyverno is disabled?
+What happens if Falco is disabled?
+What does Cosign prove?
+What is the difference between signing an image and enforcing signatures?
+Why is WIF better than stored service-account keys?
+What was the malformed-input bug in Atlas?
+Why was contaminated telemetry excluded?
+How were SLO baselines established?
+How was RTO measured?
+How was RPO measured?
+What assumptions exist in the multi-region model?
+What happens if both regions fail simultaneously?
+Why is a distributed database excluded?
+What would break at 10× current workload?
+What is actually production-ready?
+What would you change before onboarding real customers?
+144. CV POSITIONING — FUTURE, NOT THIS DOCUMENT
+The eventual CV should be:
+approximately 2 pages
+ATS-friendly
+international
+technically precise
+evidence-led
+Possible structure:
+Header
+Summary
+Skills
+Experience
+Selected Projects
+Education
+Additional labs/certifications if relevant
+Recommended project emphasis:
+Atlas
+4–5 bullets
+AWS Enterprise Cloud Platform
+4–5 bullets
+Forge
+3–4 bullets
+AI inference
+2–3 bullets
+Engineering Labs
+Condensed:
+1–2 bullets each or grouped
+The strongest measured evidence should dominate.
+145. CANDIDATE SENIORITY POSITIONING
+The user should not be presented as:
+Senior Platform Engineer
+Staff Engineer
+Principal Engineer
+unless professional evidence supports that claim.
+More defensible positioning:
+Junior-to-mid-level Platform/DevOps/Cloud candidate with unusually strong independent infrastructure evidence.
+The distinguishing factor is not years of professional employment.
+It is the depth of independently engineered systems and the quality of failure/testing evidence.
+
+146. PROFESSIONAL EXPERIENCE VS PROJECT EXPERIENCE
+The distinction must remain explicit.
+Professional / educational experience
+Mechatronics Engineering education
+Center for Tech internship/technical exposure
+Center for Tech mentoring
+teaching 20+ students
+robotics/electronics projects
+line-following robot
+automated farm project
+Independent engineering systems
+Atlas
+Enterprise Cloud Platform / Velrite
+Forge
+AI inference platform
+Engineering Labs
+Auto-Healing Kubernetes
+Terraform Kubernetes
+GitOps ArgoCD
+No independent project should be silently converted into employment.
+147. SECONDARY INCOME STRATEGY
+Separate from the Platform Engineering career.
+Positioning:
+Revenue / Operations Intelligence Specialist
+Initial niche:
+Revenue Intelligence + Reporting Automation for African e-commerce and distribution businesses
+Core philosophy:
+Sell:
+answers and automation
+rather than simply:
+dashboards
+148. REVENUE INTELLIGENCE PROBLEMS
+Target problems:
+revenue leakage
+margin leakage
+anomaly diagnosis
+reporting automation
+operational visibility
+The objective is to answer questions such as:
+Where is revenue being lost?
+Where are margins deteriorating?
+Which products/customers/channels are anomalous?
+What reports are still being manually assembled?
+Which recurring operational analyses can be automated?
+149. REVENUE INTELLIGENCE CAPABILITY PROGRESSION
+Planned stack:
+Excel / Power BI / SQL
+then:
+Python automation
+then:
+APIs
+then:
+PostgreSQL
+then:
+Git
+then:
+Docker
+then:
+basic cloud
+then:
+scheduled jobs
+150. REVENUE INTELLIGENCE OFFER DIRECTION
+Earlier package concepts included approximately:
+₦75,000
+₦150,000
+₦250,000+
+These are package ideas, not guaranteed market prices.
+Potential offer categories:
+reporting automation
+revenue dashboards
+anomaly detection
+margin analysis
+recurring reporting systems
+151. 90-DAY INCOME TARGET
+Target:
+₦1,000,000 within 90 days
+This is a goal.
+It is not guaranteed income.
+The proposed strategy included:
+Early period
+Build the capability.
+Middle period
+Create approximately three business-facing portfolio projects demonstrating:
+revenue intelligence
+reporting automation
+anomaly diagnosis
+business decision support
+Later period
+Days approximately:
+46–90
+focused increasingly on:
+outreach
+client acquisition
+offer testing
+business development
+This income strategy is distinct from the long-term Platform Engineering target.
+152. STRATEGIC CAREER TENSION
+The user has two parallel objectives:
+Primary long-term technical career
+Platform / Cloud / DevSecOps:
+$20k/month long-term target
+Secondary near-term income path
+Revenue/Operations Intelligence:
+₦1M/90-day target
+These should not be conflated.
+The second is a potential cash-flow strategy.
+The first is the main infrastructure engineering career.
+153. CURRENT PORTFOLIO STRENGTH
+The strongest evidence is not simply the number of repositories.
+The strongest evidence is:
+Atlas
+distributed scheduling
+real race condition
+atomic fix
+multi-region
+RTO/RPO
+observability
+SLOs
+GitOps
+WIF
+automated rollback
+chaos
+Enterprise AWS
+EKS
+supply-chain security
+service mesh
+runtime security
+Vault
+observability
+13 incidents
+real rollback
+fault injection
+production-shaped banking model
+Forge
+IDP architecture
+Backstage
+GitOps
+canary
+admission policy
+WIF
+AI inference
+signed supply chain
+admission enforcement
+CPU fallback
+GPU quota investigation
+reliability tests
+These are substantially stronger than ordinary “I deployed Kubernetes” portfolio projects.
+154. CURRENT PORTFOLIO WEAKNESS
+The largest professional weakness is not necessarily technical ability.
+It is:
+lack of formal production employment evidence.
+There is no claim here of:
+years operating production infrastructure for a real company
+real customer traffic
+production incident ownership inside an employer
+real on-call history
+real enterprise team ownership
+production change-management responsibility
+Therefore the career strategy must convert portfolio strength into:
+interviews
+contract work
+professional references
+real-world projects
+employment
+rather than endlessly building increasingly elaborate personal projects.
+
+
+155. CURRENT STRATEGIC DIRECTION
+The user has expressed the desire to:
+stop endless project-building and apply now.
+The portfolio is already sufficiently substantial to support applications.
+The next bottleneck is not simply another Kubernetes project.
+It is:
+positioning
+applications
+interviews
+networking
+technical storytelling
+evidence presentation
+contract acquisition
+156. PERSONAL BRAND / WEBSITE PRINCIPLE
+The website should feel like an engineer's evidence base rather than a marketing landing page.
+Useful sections include:
+system overview
+architecture
+design decisions
+failure tests
+measured results
+incidents
+remediation
+SLOs
+technical debt
+security model
+repository
+live evidence where genuinely available
+The user wants the engineering work to be difficult for a technically competent reviewer to dismiss.
+157. WHAT MAKES THE PORTFOLIO DIFFERENT
+The most defensible differentiator is:
+failure-oriented engineering evidence.
+Examples:
+20s node recovery
+32s rollback
+0 blast radius
+2→8 HPA scaling
+86% CPU
+2% post-load CPU
+48s pipeline
+36 alert rules
+13 Terraform resources
+under 2s GitOps lab drift correction
+under 3s Atlas drift correction
+99.9% declared API availability SLO in GitOps lab
+18 Atlas phases
+13 Enterprise AWS documented incidents
+24 Atlas Operator tests
+2026-09-20 real-device verification
+measured multi-region RTO/RPO
+real scheduler race-condition discovery and fix
+The number alone is not the claim.
+The important structure is:
+failure → observation → root cause → fix → re-test → measured result
+158. NON-NEGOTIABLE EVIDENCE RULE
+Whenever a future CV, LinkedIn post, website, proposal, interview answer, or application references a project:
+The underlying claim must answer:
+What was built?
+Why was it built?
+What was actually implemented?
+What was actually tested?
+What happened during testing?
+What broke?
+What was the root cause?
+What changed?
+What was the measured result?
+What remains unverified?
+Was this production, production-modeled, simulated, or a lab?
+This prevents the portfolio from becoming inflated.
+159. FINAL SOURCE-OF-TRUTH CLASSIFICATION
+Professional / real-world experience
+Mechatronics education
+Center for Tech technical exposure
+Center for Tech mentoring
+teaching 20+ students
+robotics/electronics projects
+Independent flagship
+Atlas — Distributed Resilience Platform
+Enterprise Cloud Platform / Velrite — AWS EKS
+Major independent systems
+Forge — GKE Autopilot IDP
+Production-Oriented AI Inference Platform — GCP
+Engineering Labs
+Auto-Healing Kubernetes Platform
+Terraform Kubernetes Platform
+GitOps ArgoCD Platform
+Supporting evidence
+personal website
+GitHub
+LinkedIn
+technical writing/content
+architecture documentation
+incident documentation
+ADRs
+technical-debt records
+160. MASTER TRUTH TABLE
+System
+Environment
+Classification
+Strongest verified evidence
+Major limitation
+Auto-Healing
+3-node Minikube
+Engineering Lab
+20s recovery, 32s rollback, 0 blast radius, HPA 2→8, 48s CI
+incomplete app metrics, no PDB/NetworkPolicy/signing
+Terraform Platform
+Kubernetes/Minikube
+Engineering Lab
+13 resources, modular IaC, security gates, history cleanup
+no remote state, no CI apply, no Terraform HPA
+GitOps Platform
+Kubernetes
+Engineering Lab
+drift correction under 2s, RBAC, AppSet, policy controls
+canary/chaos completion not fully verified
+Forge
+GKE Autopilot
+Major Project
+Backstage, WIF, immutable artifacts, live drift correction, canary abort
+no real users/traffic, incomplete golden path
+Atlas
+GCP
+Flagship
+18 phases, scheduler race/fix, <3s drift, measured RTO/RPO, multi-region, tracing, rollback
+explicit failure-model exclusions
+Atlas Operator
+Android + FastAPI
+Add-on
+real phone/cluster 2026-09-20, Healthy→Failed→Healthy, 24 tests
+fixture screens, no auth, no Terraform control
+Enterprise Cloud / Velrite
+AWS EKS
+Flagship
+supply chain, EKS, Istio, Vault, Kyverno, Falco, observability, 13 incidents, real rollback
+simulated bank; several controls historically unverified
+AI Inference
+GKE
+Advanced Project
+signed supply chain, admission rejection, CPU inference, rollback, load testing
+GPU blocked by GPUS_ALL_REGIONS=0.0
+161. ABSOLUTE CLAIM BOUNDARIES FOR FUTURE MATERIAL
+Never write:
+“I ran a production banking platform.”
+Write, when relevant:
+“I built a production-modeled regulated-bank platform on EKS using Bank of Anthos.”
+Never write:
+“I built a production internal developer platform used by engineers.”
+Write:
+“I built a self-service IDP on GKE Autopilot with Backstage, GitLab, Argo CD, Argo Rollouts, Kyverno and WIF.”
+Never write:
+“I deployed GPU inference infrastructure.”
+Write:
+“I engineered and validated a GKE inference platform on CPU after GCP GPU quota prevented GPU provisioning.”
+Never write:
+“All Istio security was verified.”
+Write:
+“Istio STRICT mTLS and traffic policies were configured; fault injection was verified with real timing, while live mTLS telemetry was not confirmed in the tested snapshot.”
+Never write:
+“The GitOps lab has production-grade canary delivery.”
+Write:
+“The canary rollout was configured; runtime canary triggering was not fully verified in that lab.”
+Never write:
+“The platform is completely resilient.”
+Write:
+“Specific failure modes were deliberately tested, with measured recovery and explicitly documented exclusions.”
+
+162. CORE ENGINEERING NARRATIVE
+The most coherent overall story is:
+A Mechatronics Engineering graduate developed a systems-oriented approach to engineering through robotics, electronics, programming and failure-oriented design. That evolved into software infrastructure work, Kubernetes, Terraform and cloud platforms. Rather than stopping at successful deployment, the user's independent engineering work increasingly focused on what happens when infrastructure fails: node loss, bad deployments, scheduling races, configuration drift, credential problems, observability failures, regional failover, and supply-chain attacks.
+The strongest portfolio evidence demonstrates a recurring loop:
+design → deploy → break → observe → diagnose → fix → re-test → measure → document
+That pattern is more important than any individual tool.
+## 163. LONG-TERM TECHNICAL IDENTITY
+The intended professional identity is not:
+“Someone who knows many DevOps tools.”
+It is:
+An infrastructure/platform engineer who designs cloud systems around reliability, security, observability, cost and failure recovery.
+The Mechatronics background provides a systems-engineering foundation.
+The cloud/Kubernetes work provides the infrastructure implementation.
+The incidents and measured tests provide evidence.
+The GitOps/security/observability work provides platform-engineering depth.
+The distributed systems work provides higher-order engineering complexity.
+164. MASTER EVIDENCE INVENTORY — NUMBERS THAT MUST NOT BE LOST
+The following numbers are specifically important and should be preserved when supported by the relevant project:
+20+ students taught at Center for Tech
+3-node Minikube cluster
+Kubernetes v1.31.0
+API HPA 2 → 8
+CPU peak 86%
+post-load CPU 2%
+node recovery 20 seconds
+bad-image rollback 32 seconds
+bad-image blast radius 0
+CI pipeline 48 seconds
+36 alert rules
+13 Terraform resources
+GitOps lab drift correction under 2 seconds
+Atlas drift correction under 3 seconds
+GitOps lab API SLO 99.9%
+Atlas 18 planned phases
+Enterprise AWS 13 real documented incidents
+Atlas Operator verification date 2026-09-20
+Atlas Operator 24 tests
+AI GPU quota GPUS_ALL_REGIONS=0.0
+HPA frontend max 6
+API HPA max 8
+API CPU threshold 60%
+API memory threshold 70%
+frontend CPU threshold 65%
+GitOps canary progression: 10% → 30s → 25% → 30s → 50% → 30s → 100%
+Auto-Healing pipeline: validate → deploy-canary → validate-canary → rollback → deploy-production
+These are evidence-bearing details, not decorative statistics.
+## 165. FINAL OPERATING RULE FOR FUTURE CV / APPLICATION WORK
+When generating future career material from this document:
+Preserve
+measured results
+seconds
+percentages
+replica counts
+resource thresholds
+number of incidents
+number of tests
+phase counts
+dates
+exact technologies
+actual failure conditions
+root causes
+fixes
+verification status
+Compress only when necessary
+For example, a CV can compress:
+“36 Prometheus alert rules covering pod, CPU, memory, error-rate and node failure conditions.”
+But the master document must retain the underlying details.
+Never silently upgrade
+configured → verified
+simulated → production
+production-modeled → production
+planned → implemented
+CPU inference → GPU inference
+rollback configured → rollback observed
+SLO defined → SLO achieved
+dashboard exists → telemetry works
+image signed → image admission-enforced
+Never delete negative evidence merely because it is inconvenient.
+The technical debt, failed experiments, missing telemetry, quota limitations and incidents are part of the engineering record.
+# 166. SOURCE-OF-TRUTH STATUS
+This document should be treated as the master factual reference for:
+CV generation
+portfolio writing
+LinkedIn positioning
+interview preparation
+job applications
+contract proposals
+personal website
+project README refinement
+technical case studies
+Any future artifact should derive claims from this evidence base and should preserve the project's actual verification boundary.
+The objective is not to make the user sound more experienced than they are.
+The objective is to make the actual engineering work impossible to overlook without overstating it.
+
+
