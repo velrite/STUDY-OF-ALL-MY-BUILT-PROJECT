@@ -1567,9 +1567,207 @@ Compose is for single-host deployments. Kubernetes is for multi-host clusters wi
 "Every decision in this project follows one principle — contain the blast radius. I assumed something would go wrong and designed the system so that when it does, the damage stays local."*Olamide Olalekan — Platform and DevSecOps Engineer*
 *[LinkedIn](https://linkedin.com/in/olamide-olalekan-12138a265) | [GitHub](https://github.com/velrite)*
 
+# ------------------------------------------------------------------------
+# PROJECT MASTERY — PART 1
+
+*Built strictly from what's actually documented and verified in this conversation's history. Where something wasn't confirmed, it's marked accordingly rather than assumed.*
+
+---
+
+## 1. EXECUTIVE TRUTH
+
+**One paragraph:** You built Forge, a small but real Internal Developer Platform on Google Kubernetes Engine — a system that takes a developer from "I want to ship code" to "it's running safely in production" without them touching infrastructure directly, by chaining together a developer portal (Backstage), a CI/CD pipeline (GitLab, authenticating to GCP with zero stored credentials), a GitOps controller (Argo CD) that continuously enforces Git as the source of truth, a progressive-delivery controller (Argo Rollouts) that ships new versions gradually and automatically reverts bad ones, and a policy engine (Kyverno) that blocks certain classes of mistake before they can be deployed at all.
+
+**Real-world analogy:** Think of a restaurant kitchen with a strict expediter system. A cook (developer) doesn't just throw a dish onto a plate and run it to a table. It goes through a pass — someone checks it meets standard (CI tests, security scan), a runner carries it out gradually to make sure the table's actually ready for it (canary rollout), and if the table sends it back, the kitchen immediately pulls the next plate off the line and serves the previous known-good dish instead (automated rollback) — all without the head chef having to personally watch every single plate.
+
+**Technical version:** A GitOps-driven platform on GKE Autopilot, where GitLab CI (WIF-authenticated, no static keys) builds and pushes container images to Artifact Registry, Argo CD reconciles declared Kubernetes state from a GitHub repo, Argo Rollouts executes staged canary delivery gated by live Prometheus queries, and Kyverno enforces admission-time policy — all instrumented with kube-state-metrics-based SLOs and OpenCost-based cost attribution.
+
+**Non-technical version:** A self-updating system that safely gets new software live, checks its own health while doing so, automatically undoes a bad change, and enforces its own rules — without a human having to babysit every deployment.
+
+**Executive/CTO version:** This demonstrates the operational discipline a CTO actually cares about, independent of any specific product it might one day run: credential-free CI/CD auth (removes a standing breach surface), automated bad-deploy detection with zero-downtime rollback (removes a class of incident that would otherwise need a human awake at 2am), and enforced deployment policy (removes reliance on developers remembering rules). What it is *not* yet: a platform proven under real user load, or one with finished developer self-service (the publish-to-repo step is incomplete — see Technical Debt).
+
+**Senior-engineer version:** The interesting engineering here isn't "used Kubernetes" — it's the specific, non-obvious permission and scheduling problems solved along the way: `storage.buckets.list` being a project-only permission invisible to bucket-scoped IAM, kubectl's client-side apply hitting a hard 262144-byte annotation ceiling on large CRDs, Kubernetes scheduling against *requested* not *actual* memory causing misleading "low utilization, still Pending" states, and Argo Rollouts' Prometheus provider always returning arrays even for scalar queries. None of these are documented prominently anywhere obvious — they were each found by going underneath a wrapped error message to the raw API response.
+
+---
+
+## 2. EVIDENCE INVENTORY
+
+| Area | Evidence Found | Confidence | Importance | Missing Info |
+|---|---|---|---|---|
+| Cloud project/region | `forge-platform-11124`, `us-central1` | [IMPLEMENTED] | High | — |
+| Cluster | `forge-cluster`, GKE Autopilot, regional, private nodes | [IMPLEMENTED] | High | — |
+| Networking | VPC `forge-vpc`, subnet `forge-subnet`, Cloud NAT | [IMPLEMENTED] | Medium | Exact CIDR ranges not restated here |
+| IaC | Terraform, GCS backend state, `terraform plan` confirmed clean | [IMPLEMENTED] | High | Full module structure not fully re-verified in this session |
+| Container registry | Artifact Registry `forge-images`, immutable tags | [IMPLEMENTED] | High | — |
+| CI/CD | GitLab CI/CD, WIF auth (no keys), full IAM chain documented | [IMPLEMENTED] | High | — |
+| GitOps | Argo CD, `forge-demo` application, self-heal demonstrated live | [IMPLEMENTED] | High | Current sync state at time of reading unknown (may be scaled to 0) |
+| Progressive delivery | Argo Rollouts, canary 20/50/100, AnalysisTemplate via Prometheus | [IMPLEMENTED] | High | — |
+| Policy | Kyverno, 3 ClusterPolicies (1 Enforce, 2 Audit), block verified live | [IMPLEMENTED] | High | — |
+| Observability | Prometheus/Grafana/Alertmanager/OTel Collector | [IMPLEMENTED — partial] | High | Grafana rendering unconfirmed; tracing is debug-log only |
+| Cost | OpenCost, real per-namespace numbers pulled once | [IMPLEMENTED] | Medium | Not continuously monitored |
+| Secrets | No credentials in source; Backstage GitLab token as K8s Secret | [IMPLEMENTED] | High | — |
+| Developer portal | Backstage, SQLite in-memory, guest auth, running as Rollout | [IMPLEMENTED — limited] | High | No metrics plugin; catalog doesn't survive restart |
+| Golden path | Scaffolder template exists | [IMPLEMENTED — incomplete] | Medium | Publish-to-repo step not built (ADR-010) |
+| Alerting | Slack webhook configured in Alertmanager | [CONFIGURED, UNVERIFIED] | Low-Medium | Delivery never confirmed |
+| Vulnerability scanning | Enabled on Artifact Registry | [CONFIGURED, UNVERIFIED] | Medium | No scan output ever reviewed |
+| Network policies | — | [UNKNOWN] | Medium | Not built; listed as planned |
+| Image signing/SBOM | — | [NOT IMPLEMENTED] | Medium | Explicitly planned-not-built |
+
+---
+
+## 3. ARCHITECTURE RECONSTRUCTION — REQUEST/CHANGE LIFECYCLE
+
+The relevant "lifecycle" here isn't a user HTTP request — it's a **code change reaching production**:
+
+1. Developer commits to the GitHub repo (canonical source of truth).
+2. Push mirrored to GitLab (CI execution target — namespace `velrite-group`).
+3. GitLab CI pipeline triggers (currently gated by `rules: changes: platform/backstage/**/*` — a change to only `terraform/*.tf` will **not** auto-trigger).
+4. Pipeline authenticates to GCP via Workload Identity Federation — GitLab issues a short-lived OIDC token, GCP's STS exchanges it, no static credential exists anywhere in this chain.
+5. Test → security scan → build stages run.
+6. Source is packaged manually (`tar` + `gcloud storage cp`) and uploaded to a dedicated GCS bucket — **not** via `gcloud builds submit`'s own auto-upload, which was confirmed broken under WIF identities.
+7. Cloud Build builds the image, pushes to Artifact Registry under a unique tag (immutability enabled — a second push to the same tag is rejected by the registry itself).
+8. A Kubernetes manifest (or Rollout spec) referencing the new tag is updated in Git.
+9. Argo CD detects the drift between declared and live state, reconciles it.
+10. Argo Rollouts executes the canary: 20% traffic → pause → `AnalysisTemplate` query against Prometheus (`kube_deployment_status_replicas_ready`) → 50% → pause → analysis → 100%.
+11. If analysis fails at any step, the Rollout aborts automatically — stable revision keeps serving 100% of traffic throughout, confirmed via a deliberate bad-image test.
+12. Kyverno's admission webhook has already been checking every object creation throughout this whole chain, independent of the above — a `:latest`-tagged pod would never even reach step 10.
+
+---
+
+## 4. ARCHITECTURE MAP
+
+```
+┌────────────────────┐
+│ Developer           │
+└─────────┬────────────┘
+          │ git push (source code)
+          ▼
+┌────────────────────┐        mirror        ┌────────────────────┐
+│ GitHub (canonical)   │ ───────────────────▶ │ GitLab (CI exec)     │
+└─────────┬────────────┘                      └─────────┬────────────┘
+          │                                              │ OIDC token (WIF)
+          │                                              ▼
+          │                                   ┌────────────────────┐
+          │                                   │ GCP STS / IAM         │
+          │                                   └─────────┬────────────┘
+          │                                              │ scoped access token
+          │                                              ▼
+          │                                   ┌────────────────────┐
+          │                                   │ Cloud Build            │
+          │                                   └─────────┬────────────┘
+          │                                              │ container image (unique tag)
+          │                                              ▼
+          │                                   ┌────────────────────┐
+          │                                   │ Artifact Registry      │
+          │                                   │ (immutable tags)       │
+          │                                   └─────────┬────────────┘
+          │ manifest update (image tag)                 │ image pull
+          ▼                                              │
+┌────────────────────┐                                  │
+│ Argo CD              │◀──── watches Git state ─────────┘
+└─────────┬────────────┘
+          │ reconciles declared state
+          ▼
+┌────────────────────┐
+│ Argo Rollouts         │──── queries ───▶ Prometheus (readiness signal)
+└─────────┬────────────┘
+          │ staged traffic shift
+          ▼
+┌────────────────────┐
+│ GKE Autopilot          │
+│ (forge-cluster)        │
+└─────────┬────────────┘
+          │ every object creation checked
+          ▼
+┌────────────────────┐
+│ Kyverno (admission)    │
+└────────────────────┘
+
+Cross-cutting, always present:
+- Prometheus/Grafana/OTel ── scrapes/observes everything above
+- OpenCost ── attributes cost by namespace across everything above
+```
+
+---
+
+## 5. TECHNOLOGY DNA (condensed — full per-technology breakdown available on request for any specific item)
+
+| Technology | Category | Core Problem It Solves Here | Key Trade-off Accepted |
+|---|---|---|---|
+| GKE Autopilot | Compute/orchestration | Removes node-lifecycle management as a competing concern | Less control over node sizing/bin-packing; memory ceiling hit repeatedly |
+| Terraform | IaC | Reproducible, diffable infrastructure; zero-drift verifiable | State must be protected (GCS, versioned) — a real single point of failure if lost |
+| Workload Identity Federation | Identity | Removes stored service-account keys entirely | More complex initial setup — the IAM chain took many iterations to get right |
+| Argo CD | GitOps | Git as enforced desired state; auto-reverts manual drift | Manual emergency changes get silently reverted unless the operator knows to pause sync |
+| Argo Rollouts | Progressive delivery | Staged traffic shift + automated health-gated abort | Analysis quality is only as good as the signal it queries (Kubernetes-level here, not app-level) |
+| Kyverno | Policy-as-code | Admission-time enforcement in plain YAML, no separate policy language | Broad Enforce-everywhere would risk breaking existing workloads; mitigated via deliberate Audit/Enforce split |
+| Prometheus/kube-state-metrics | Observability | Real, live cluster-state signal | No application-level metrics for Backstage specifically — a real, named gap |
+| OpenCost | FinOps | Real computed cost, not estimated | Only as accurate as its Prometheus data source config (was misconfigured once, fixed) |
+
+---
+
+## 6. DECISION INVENTORY (meaningful, evidence-backed decisions only)
+
+1. GKE Autopilot over Standard — [IMPLEMENTED], reasoning documented (ADR-003)
+2. Argo CD manages application workloads only, not platform infra — [IMPLEMENTED], reasoning documented (ADR-005)
+3. Backstage uses SQLite in-memory — [IMPLEMENTED], deliberate demo-scope trade-off (ADR-007)
+4. Dependency pinning discipline (never `@latest`) after a real quarantine incident — [IMPLEMENTED] (ADR-008)
+5. Unique image tags, never `:latest` — [IMPLEMENTED], directly caused by a real registry rejection (ADR-011)
+6. GitLab authenticates via WIF, scoped to one namespace — [IMPLEMENTED] (ADR-012)
+7. SLOs sourced from Kubernetes-level signals, not app-level — [IMPLEMENTED], because Backstage has no metrics plugin (ADR-015)
+8. Kyverno Enforce vs Audit split — [IMPLEMENTED], deliberate rollout-safety reasoning
+
+---
+
+## 7. UNKNOWNS / MISSING EVIDENCE
+
+- [UNKNOWN] Whether the Grafana SLO dashboard actually renders live data — configured, never confirmed.
+- [UNKNOWN] Whether Slack alert delivery actually works — configured, test fired, delivery never confirmed by the operator.
+- [UNKNOWN] Vulnerability scan results — scanning enabled, output never pulled or reviewed.
+- [UNKNOWN] Current live state of the cluster/workloads at the moment you read this — several components were deliberately scaled to 0 for memory management during past sessions and may or may not have been restored.
+- [NOT IMPLEMENTED] Network policies, image signing, SBOM generation — explicitly planned, not built.
+- [NOT IMPLEMENTED] Golden-path publish-to-repo step — scaffolding works, publishing does not.
+
+---
+
+## 8. INITIAL ARCHITECTURE REVIEW
+
+**Strengths:** The credential-free CI/CD auth chain is genuinely well-reasoned and behaviorally proven, not just configured. The canary/rollback mechanism is proven with a real bad-deploy test showing zero downtime to the stable revision. The debugging discipline shown throughout (raw HTTP diagnostics over trusting wrapped error text, local reproduction before trusting a full pipeline run) is a real, transferable engineering habit, not incidental.
+
+**Weaknesses:** Observability has real gaps at the application layer — every SLO in this project is a Kubernetes-health proxy, not a true user-experience signal. The platform runs consistently close to its memory ceiling, which has caused repeated, avoidable-looking failures that were actually the same root cause recurring (a pattern worth being able to name precisely, not just patch around each time).
+
+**Risks:** Single-replica-pair, effectively single-zone Backstage with an in-memory catalog is a real availability and data-durability risk if this were ever treated as more than a demo. The unconfirmed alerting path means, as of today, there is no proven way this platform would actually notify a human of a real problem.
+
+**Unknowns:** Current live state (see above) — don't assume anything is running without checking `kubectl get pods --all-namespaces` first.
+
+**Technical debt:** Catalogued in full in the earlier documentation package — golden-path publish, Grafana confirmation, Slack confirmation, node-failure testing never performed (a deliberate risk call, not an oversight), the superseded-but-not-deleted FinOps report.
+
+---
+
+## 9. KNOWLEDGE GAPS (preview — full breakdown comes in Stage 30)
+
+**MUST KNOW to defend this project:** the exact IAM chain reasoning for `storage.admin` (why not `objectAdmin`), why `metadata.labels.app` differs from `spec.selector.app` on a Service, why `kubectl apply --server-side` was required for the Rollouts/Argo CD CRDs, and the two independent identity states (`gcloud` project vs `kubectl` context) that must both be checked.
+
+**SHOULD KNOW:** the full canary AnalysisTemplate query evolution (why the array-index fix was needed), the Kubernetes scheduling-vs-usage distinction that caused the repeated memory-pressure incidents.
+
+**ADVANCED:** Workload Identity Federation's trust-condition mechanics end to end, GitOps reconciliation loop internals.
+
+---
+
+## 10. MASTERY ROADMAP
+
+Next, in order, unless you want to jump ahead: **Stage 5 (the WHY engine)** on the three or four decisions above with the least-settled reasoning in your own head right now, then **Stage 11 (failure mode analysis)** since you already have real, lived failure data to draw from rather than hypotheticals, then **Stage 20 (rebuild without AI)** once the reasoning is solid.
+
+Tell me which stage to run next, or tell me which of the decisions in Section 6 you're *least* confident you could defend cold — that's usually the more useful starting point than going in strict numeric order.
 
 
-# -------------------------------------______________________________________---------------------------------------
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
 Project Title
 
 Enterprise Cloud Platform — Secure DevSecOps Platform on AWS EKS
