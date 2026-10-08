@@ -1,3 +1,50 @@
+# Project: Production-Pattern AI Inference Platform on GKE
+
+## One-line summary (pick whichever fits the CV format):
+Designed and operated a GKE-based LLM inference platform implementing a signed software supply chain, GitOps deployment, admission-controlled security enforcement, and network segmentation — validated end-to-end under a real GPU quota constraint.
+
+## Tools used, and the actual reason each one was there
+
+### Terraform — 
+infrastructure as code for the GKE cluster, node pools, VPC, IAM, Workload Identity Federation, and Artifact Registry. Used because infra needed to be reproducible after deliberate teardown/rebuild cycles (cost discipline between sessions), not hand-clicked in the console.
+
+### Google Kubernetes Engine (GKE) — 
+the runtime. Three node pools: system, CPU-inference, and a GPU pool kept at zero nodes (autoscaling min=0) due to a real, documented GPUS_ALL_REGIONS=0 quota constraint on the GCP account.
+
+### vLLM — 
+the inference server, running Qwen2.5-1.5B-Instruct on CPU. Chose vLLM specifically because the original design target was GPU; when quota was denied, the same serving stack pivoted to CPU without a rewrite — a real adaptation under constraint, not a plan B bolted on.
+
+### GitHub Actions + Workload Identity Federation — 
+CI pipeline authenticates to GCP with no static service-account keys stored anywhere, using short-lived OIDC tokens instead.
+
+### Trivy + Syft + Cosign — 
+the actual supply-chain chain: Trivy scans the built image for CRITICAL CVEs (with documented, justified exceptions for unexploitable kernel-header CVEs); Syft generates a real SBOM, uploaded as a build artifact; Cosign signs the image using a dedicated key pair, with the private key stored only as a GitHub secret.
+
+### Kyverno — 
+admission controller that cryptographically verifies Cosign signatures on every pod scheduled from the protected image path, and rejects anything that isn't signed. This was built, installed, and tested live in both directions: a pod with an unsigned/nonexistent image tag was genuinely denied by the admission webhook; the real CI-signed image was genuinely allowed through.
+
+### ArgoCD — 
+GitOps continuous deployment. The cluster's live state is reconciled from the GitHub repo, not applied manually. Proven by tracing one real commit SHA through three independent systems simultaneously: git rev-parse HEAD, the Cosign-signed tag in Artifact Registry, and ArgoCD's status.sync.revision — all matching.
+
+### Kubernetes NetworkPolicy — 
+default-deny-all baseline with an explicit allow rule for only the granted traffic path.
+
+### OpenCost + self-hosted Prometheus — 
+real per-namespace cost attribution pulling actual GCP list pricing via the Cloud Billing API, not estimated.
+
+## What was actually demonstrated (not claimed — demonstrated, with command output as evidence)
+Infrastructure survived a deliberate terraform destroy, a soft-deleted Workload Identity Federation pool/provider, and an accidental documentation deletion — all recovered using git history and gcloud ... undelete + terraform import, not a rebuild from scratch.
+A broken CI pipeline (failing on undocumented CRITICAL CVEs) was diagnosed from real GitHub Actions logs, fixed, and verified green end-to-end — build, scan, SBOM, sign.
+Admission-controlled image signing was tested with two opposing live pod deployments, not just a policy file sitting unused.
+GitOps sync was proven with a genuine reconciliation cycle, including catching and correcting an unintended side effect (ArgoCD syncing an abandoned GPU manifest alongside the real CPU deployment).
+A real GCP GPU quota denial was documented as an architectural constraint, not hidden — the platform's design target was GPU inference; the honest limitation is stated in the README rather than glossed over.
+Honest framing for the CV (say this, not more)
+
+This is a personal/test-tier GCP project (free-trial credits, dev project, no production traffic or users) — don't let your CV agent phrase it as "production system serving users" or invent uptime/latency/cost-savings numbers. The strength of this project isn't scale, it's that every control — signing, enforcement, GitOps, cost tracking, disaster recovery — was actually built, actually tested, and actually proven with live command output, including the parts that initially failed and had to be fixed. That's the honest, provable story, and it's a strong one without embellishment.
+
+### A good CV bullet, grounded exactly in the above:
+
+"Built and operated a GKE-based LLM inference platform with a Cosign-signed, Trivy-scanned container supply chain, Kyverno-enforced admission control, and ArgoCD-driven GitOps deployment — verified end-to-end via live cluster tests, including admission-webhook signature rejection/acceptance and cross-system commit-SHA chain-of-custody."
 # Project 7 — AI Inference Platform (GKE)
 
 **Author:** Olamide (Velrite) — GitHub: velrite
