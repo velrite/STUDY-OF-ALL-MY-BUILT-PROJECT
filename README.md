@@ -1,6 +1,6 @@
 
 
-# GitOps ArgoCD Platform
+#  CODESPACE GitOps ArgoCD Platform
 
 ## What Is This Project?
 
@@ -1199,7 +1199,7 @@ gitops-argocd-platform/
 
 
 # ------------------------------------------------------------------------------------------
-# Terraform Kubernetes Platform
+# CODESPACE Terraform Kubernetes Platform
 
 ## What Is This Project?
 
