@@ -1,3 +1,1076 @@
+# Production Platform on Kubernetes
+
+### Build record, architecture, decision log, and engineering defense
+
+> **Evidence status.** The AWS account that hosted this platform is currently **closed** (the Free Plan credits were used up; AWS's notice gives a reactivation deadline of **December 3, 2026**). Nothing here can be re-verified against a live cluster until the account is reactivated.
+> Everything labelled **VERIFIED** was observed in real terminal output during the build (logs show activity between 2026-07-26 and 2026-08-08). Screenshots are to be captured after reactivation. Nothing in this document claims more than what was observed.
+
+**Labels used throughout:** `CURRENT IMPLEMENTATION` · `DESIGN DECISION` · `ASSUMPTION` · `RECOMMENDATION` · `PRODUCTION ALTERNATIVE` · `KNOWN LIMITATION`
+**Evidence tags:** `VERIFIED` (observed output) · `PARTIAL` · `NOT VERIFIED` · `NOT BUILT` · `UNKNOWN`
+
+**Related documents (kept in `docs/`):** `ARCHITECTURE.md` · `ADR.md` · `SECURITY.md` · `CAPACITY_AND_COST.md` · `RUNBOOK.md` · `INCIDENTS.md` · `TESTING_AND_VALIDATION.md` · `ROADMAP_AND_GAPS.md` · `SIMPLICITY_VS_PRODUCTION_TRADEOFFS.md`
+
+---
+
+## Claim Verification Register
+
+This table comes first because every later section depends on it.
+
+| Capability | Status | What the evidence actually is |
+|---|---|---|
+| 3-AZ VPC, per-AZ NAT, public/private subnets | VERIFIED | `terraform apply` completed; `describe-vpcs` returned `available`; plan listed subnets in us-east-1a/b/c |
+| EKS cluster (v1.35) + system node group | VERIFIED | `kubectl get nodes` showed Ready nodes; `kube-system` showed coredns, kube-proxy, aws-node Running |
+| Karpenter scale-up | VERIFIED | Logs: `computed new nodeclaim(s)` ×6, `launched nodeclaim` ×6 with real instance IDs; `describe-instances` showed all running; nodes reached Ready |
+| Karpenter scale-down (consolidation) | PARTIAL | Policy configured; node reduction was not explicitly watched end to end |
+| GitOps sync via ArgoCD | VERIFIED | Applications `Synced`/`Healthy`; pods created from manifests in git |
+| ArgoCD self-heal (revert manual edits) | NOT VERIFIED | Configured (`selfHeal: true`); a manual drift was never introduced to trigger it |
+| NGINX Ingress + AWS NLB serving traffic | VERIFIED | `curl` to the NLB returned the nginx welcome page |
+| TLS from a private CA (cert-manager) | VERIFIED | `Certificate hello-tls READY=True`; `curl` failed with `SSL certificate problem: unable to get local issuer certificate` (expected for an untrusted private root); HTTP→HTTPS `308` observed |
+| ExternalDNS → Route53 private zone | VERIFIED | Logs showed `CREATE` for A/AAAA/TXT; `list-resource-record-sets` showed the records; in-cluster `nslookup` resolved the name |
+| Horizontal Pod Autoscaler | VERIFIED | `describe hpa` events: `SuccessfulRescale` to 6, then 4 (with the target temporarily lowered to 10%) |
+| Zero-downtime rolling update | VERIFIED (small sample) | 0 non-200 responses out of 18 requests during a rollout |
+| Node failure recovery | VERIFIED | Instance terminated; pods back to 2/2 Ready in 101 s on a newly provisioned node |
+| Persistent volume binding | VERIFIED | `hello-data` reached `Bound` |
+| Data surviving pod/node replacement | NOT VERIFIED | No data was written and re-read across a reschedule |
+| RBAC | PARTIAL | `developer` ClusterRole exists; it is **not bound to any user or group** and was never exercised |
+| NetworkPolicy enforcement | **NOT VERIFIED, evidence points the other way** | See Part 12. Load-generator pods in the same namespace reached the app despite a default-deny ingress policy |
+| Pod Security Standards | VERIFIED (warn) / NOT VERIFIED (enforce) | `warn: restricted` produced real warnings; `enforce: baseline` label is present but no violating pod was tested |
+| Multi-environment (dev/staging/prod) | PARTIAL | Pods Running and Applications Healthy in all three; the environments are identical and lack the controls applied to `default` (see Part 19) |
+| CI pipeline (build/test/scan) | NOT BUILT | |
+| Monitoring dashboards, alerting, log aggregation | NOT BUILT | Only metrics-server (for HPA) exists |
+| EKS control-plane audit logging | VERIFIED DISABLED | `describe-cluster` showed all log types `enabled: false` |
+| Backups (EBS snapshots, CA secret) | NOT IMPLEMENTED | |
+| S3 state versioning | VERIFIED | `get-bucket-versioning` → `Enabled` |
+| Formal load test (latency percentiles, breaking point) | NOT VERIFIED | One attempt produced invalid data and was discarded (Part 15) |
+| EKS version upgrade | NOT EXECUTED | Procedure documented only |
+| Live environment today | UNAVAILABLE | Account closed |
+
+---
+
+# PART 1 — What this project is, in plain language
+
+**What is it?**
+A reusable "foundation" for running applications on the cloud. Think of it as building the road system, traffic lights, locks, and utilities for a town, before any shops open. The shops (applications) come later and can all use the same infrastructure.
+
+**What problem does it solve?**
+Getting an application running once is easy. Getting it running *repeatably*, *safely*, and *recoverably* is hard. Most outages and security incidents come from manual changes nobody wrote down, deployments that can't be undone, and systems that nobody knows how to rebuild. This project replaces manual steps with written, version-controlled instructions that a machine follows.
+
+**Who would use it?**
+A small engineering team that needs a shared place to run several applications, or an engineer who needs to show how such a place is built and operated.
+
+**What does it do?** (input → processing → output)
+- *Input:* code describing the infrastructure, and files describing which applications should run.
+- *Processing:* a tool builds the network and a Kubernetes cluster from the code; another tool continuously compares the running applications against the files in Git and corrects any difference.
+- *Output:* a running cluster that serves web traffic over HTTPS, gives applications names, adds machines and application copies when busy, and can be rebuilt from nothing in roughly 20–25 minutes.
+
+**Why does it matter?**
+It shows the difference between *deploying* software and *operating* it: what happens when a machine dies, a deployment is wrong, or a dependency changes behaviour.
+
+**My engineering mission.**
+I designed, built, broke, debugged, and documented the platform alone. I did not build Kubernetes, Terraform, ArgoCD, or Karpenter. I built the configuration and operational layer around them, and the documentation of what went wrong while doing it.
+
+---
+
+# PART 2 — Engineering objective
+
+**Primary objective.** Provision and operate a multi-environment Kubernetes platform on AWS entirely from code, with GitOps delivery, automated TLS and DNS, node-level and pod-level autoscaling, and baseline security controls, and demonstrate its behaviour under failure.
+
+**Secondary objectives.** Document real failures honestly. Keep cost controllable by making the whole stack disposable. Produce a runbook that lets someone else rebuild and tear down safely.
+
+### Functional requirements
+1. Provision networking, cluster, and identity with Terraform.
+2. Deploy applications from Git using ArgoCD.
+3. Route external traffic through an ingress controller and a load balancer.
+4. Issue and renew TLS certificates automatically.
+5. Create DNS records automatically from Kubernetes resources.
+6. Scale pods (HPA) and nodes (Karpenter) automatically.
+7. Provide persistent storage.
+8. Separate dev, staging, and prod.
+9. Apply RBAC, network policy, and pod security controls.
+
+### Non-functional requirements
+| Property | Target | Status |
+|---|---|---|
+| Reproducibility | Full rebuild from code | VERIFIED several times (with defects, Part 22) |
+| Recoverability | Node loss recovered automatically | VERIFIED (101 s) |
+| Availability | Survive a single-AZ failure | DESIGNED (3 AZs, 3 NATs); **NOT TESTED** |
+| Security | Least privilege per component | PARTIAL (see Part 12) |
+| Observability | Know when users are affected | **NOT BUILT** |
+| Cost | Pay only while running | Discipline-based, not automated |
+| Simplicity | Prefer the simpler choice | Mixed: two deliberate over-engineering choices (Part 25) |
+
+### Constraints
+- Solo operator.
+- AWS account on the **Free Plan** (created after 2025-07-15): instance types restricted to an allow-list (t3.micro/small, t4g.micro/small, c7i-flex.large, m7i-flex.large) and a finite credit balance.
+- No owned public domain (a private DNS zone and private CA were used instead).
+- Development moved from GitHub Codespaces (quota exhausted) to WSL2 on Windows, where the GitHub Pages CDN range was unreachable and the MTU needed lowering for AWS API calls.
+
+### Assumptions
+- `ASSUMPTION` One cluster with three namespaces is an acceptable stand-in for three environments at this scale.
+- `ASSUMPTION` Free Plan credits would cover a short, repeatedly destroyed build. **This assumption was wrong in aggregate**: the credits ran out and the account was closed (Part 17).
+
+### Success criteria
+Every item in the register above marked VERIFIED can be reproduced by someone else following Part 22.
+
+### Known limitations
+Listed in full in Parts 26 and 27. The headline ones: no CI, no observability, NetworkPolicy enforcement unproven, RBAC unbound, environments not equivalent, account currently closed.
+
+---
+
+# PART 3 — System at a glance
+
+## 3.1 High-level architecture
+
+```mermaid
+flowchart TB
+    Dev["Engineer"] -->|terraform apply| TF["Terraform"]
+    TF --> AWS["AWS: VPC, EKS, IAM, Route53, EBS CSI"]
+    Dev -->|git push| Git[("GitHub repo: gitops/")]
+    Git -.->|watched| Argo["ArgoCD"]
+    subgraph Cluster["EKS cluster across 3 AZs"]
+        Argo -->|applies manifests| Apps["hello app: default, dev, staging, prod"]
+        Karp["Karpenter"] -->|launches and removes| Nodes["Bottlerocket nodes"]
+        HPA["HPA + metrics-server"] -->|scales replicas| Apps
+        Cert["cert-manager private CA"] -->|issues TLS cert| Ing
+        ExtDNS["ExternalDNS"] -->|writes records| R53[("Route53 private zone")]
+        Ing["NGINX Ingress"] --> Apps
+    end
+    Client(("Client")) -->|HTTPS| NLB["AWS Network Load Balancer"]
+    NLB --> Ing
+```
+
+## 3.2 Component responsibilities
+
+| Component | What it is / does | Why it exists | Depends on | Depended on by | If it vanished |
+|---|---|---|---|---|---|
+| S3 state bucket | Stores Terraform's record of what exists | Lets Terraform know what it built, from any machine | AWS account | Terraform | Terraform loses memory and cannot safely change or destroy anything |
+| VPC + subnets + NAT | The private network | Isolates nodes; gives them outbound-only internet | AWS | Everything in the cluster | No network, no cluster |
+| EKS control plane | Managed Kubernetes brain | Schedules and tracks all workloads | VPC, IAM roles | Everything in-cluster | Cluster unusable |
+| System node group | 2 fixed machines | A place for cluster-critical pods to start | EKS, node IAM role | Karpenter, CoreDNS | Nothing can run until Karpenter provisions nodes, and Karpenter needs a node to run on |
+| Karpenter | Launches/terminates machines to fit pending pods | Elastic capacity | IAM role, discovery tags, SQS, node access entry | Any workload beyond system capacity | Pending pods stay pending (observed) |
+| ArgoCD | Compares Git to the cluster and corrects differences | Git becomes the source of truth | Git repo, cluster | Application deployment | Changes must be applied by hand |
+| NGINX Ingress + NLB | Receives traffic, routes by hostname | One public entry point instead of one load balancer per app | NLB, Service, Certificate | External access | No external traffic |
+| cert-manager | Issues and renews TLS certificates | No manual certificate work | Issuers, Ingress | HTTPS | Certificates expire silently |
+| ExternalDNS | Writes DNS records from Ingress resources | Names follow the load balancer's changing address | Route53 zone, IAM role | Name resolution | Manual DNS edits after each rebuild |
+| metrics-server + HPA | Measures CPU and adjusts replica count | Pod-level scaling | Resource requests on pods | Elastic pod count | Fixed replica count |
+| EBS CSI driver | Creates and attaches disks | Persistent storage | IAM role, StorageClass | PVCs | Volumes cannot be provisioned |
+
+## 3.3 Data flow
+
+**A web request:**
+```
+Client resolves hello.platform.internal (private zone, resolvable inside the VPC)
+  → AWS NLB
+  → NGINX Ingress pod (terminates TLS with the cert-manager certificate; HTTP gets a 308 redirect)
+  → Service "hello"
+  → one of the hello pods
+  → response returns by the same path
+```
+
+**A change:**
+```
+Edit manifest → git push → ArgoCD detects the difference (poll, or manual refresh)
+  → applies it (automated sync, prune, self-heal) → Kubernetes rolls pods → health reported
+```
+
+**Infrastructure change:**
+```
+Edit .tf → terraform plan (read the plan) → terraform apply → state written to S3
+```
+
+> **What You Should Understand Before Continuing**
+> There are two separate control paths: Terraform builds what *exists in AWS*; ArgoCD manages what *runs inside Kubernetes*. Neither knows about the other. Several real failures (Parts 13, 24) happened in the gap between them, for example a load balancer that Kubernetes created and Terraform never knew about.
+
+---
+# PART 4 — Dependency graph (why the build order is forced)
+
+```
+AWS identity + billing guard
+   → remote state (S3, lock)
+      → Terraform scaffolding (backend, provider, variables)
+         → network (VPC, subnets, IGW, NATs, routes)
+            → EKS control plane (needs subnets + cluster IAM role)
+               → node group (needs private subnets + node IAM role)
+                  → cluster access (access entries) → kubectl works
+                     → Pod Identity agent
+                        → EBS CSI (needs agent + role)
+                        → Karpenter prerequisites (IAM stack, controller role, discovery tags, node access entry)
+                           → Karpenter + NodePool
+                              → ingress → cert-manager → Route53 zone + ExternalDNS
+                              → ArgoCD → applications
+                                 → policies (RBAC, NetworkPolicy, PSS)
+                                 → metrics-server → HPA
+                                    → failure and scale tests
+                                       → automation scripts → documentation
+```
+
+| Step | Must come before | Because | If skipped |
+|---|---|---|---|
+| Remote state | Any `terraform apply` | State on a laptop disappears with the laptop; a second machine would not know what exists | Orphaned, billing resources nobody can track (this nearly happened when the Codespace was lost) |
+| Network | Cluster | EKS needs subnets at creation | Cluster cannot be created |
+| Cluster access entries | Anything using `kubectl` | `authentication_mode = "API"` grants no one access by default here | "You must be logged in to the server" (observed) |
+| Pod Identity agent | EBS CSI, Karpenter, ExternalDNS | Pods get AWS credentials through it | Those pods start but fail every AWS call |
+| Karpenter IAM + discovery tags | Karpenter install | It must be authorized and must find subnets and security groups | CrashLoopBackOff (missing policies) or silent no-op (missing tags) — both observed |
+| Node access entry | Karpenter-launched nodes joining | Node role must be recognised by the cluster | Instances run in EC2 but never become nodes (observed) |
+| Ingress | cert-manager certificate use, ExternalDNS records | Both react to Ingress resources | No hostname to certify or publish |
+| ArgoCD | Applications managed by Git | It is the thing doing the managing | Apps must be applied by hand |
+| metrics-server | HPA | HPA reads CPU from it | HPA target shows `<unknown>`, never scales |
+
+> **Ordering defect found while writing this README** (`KNOWN LIMITATION`, details in Part 22): `eks.tf` attaches six IAM policies and one access entry that are created by a **CloudFormation stack deployed later by `full-rebuild.sh`**. During the actual build the stack already existed, so `terraform apply` worked. On a fresh account it would fail. The stack must be deployed *before* `terraform apply`.
+
+---
+
+# PART 5 — Build step by step
+
+Each step: Objective · Why now · What · Concept · Implementation · Why this · Depends on this · Breaks if wrong · Verification · Mistakes · Underrated detail · Interview.
+
+---
+
+### STEP 1 — Define scope and constraints
+- **Objective:** Fix what is being built and what is not, before touching AWS.
+- **Why now:** Every later choice (HA, cost, tool) is judged against it.
+- **What:** The list in Part 2. Notably: one region (us-east-1), single operator, private DNS/CA.
+- **Concept:** *Simple:* decide what the house is for before buying bricks. *Engineering:* requirements bound the design space; unstated constraints (here, the Free Plan allow-list) turn into incidents later.
+- **Implementation:** No code.
+- **Why this:** The Free Plan restriction was **not** known at this point. That omission cost 16+ minutes (Incident 2).
+- **Depends on this:** Everything.
+- **Breaks if wrong:** Late discovery of constraints.
+- **Verification:** Requirements written and agreed.
+- **Mistakes:** Treating account type as irrelevant.
+- **Underrated detail:** Cloud accounts have hidden policy layers (quotas, plan restrictions, credit balance) that no tutorial mentions.
+- **Interview (30 s):** "I scoped for production *patterns* on a solo budget, then discovered the account itself had constraints I hadn't asked about. Now I check account-level restrictions first."
+
+---
+
+### STEP 2 — AWS identity and billing guard
+- **Objective:** A dedicated identity for Terraform and a way to notice spend.
+- **Why now:** No infrastructure should exist without a way to control it.
+- **What:** IAM user `terraform-cli`, a billing alert (threshold `UNKNOWN`; the alert was created before this build).
+- **Concept:** *Simple:* a named key for the builder, not the master key. *Engineering:* separate identity from the root account.
+- **Implementation:** Existing IAM user with `AdministratorAccess` attached.
+- **Why this:** `DESIGN DECISION` Scoping a least-privilege policy before knowing every service Terraform would touch would have produced either constant permission failures or a policy that is admin in disguise. Deferred deliberately (ADR-008).
+- **Depends on this:** All provisioning.
+- **Breaks if wrong:** A leaked key is full account compromise.
+- **Verification:** `aws sts get-caller-identity` returned the `terraform-cli` user ARN (not root).
+- **Mistakes:** Using root keys; leaving two active keys.
+- **Underrated detail:** Spend alerts and credit balances are different things. Cost Explorer later showed ≈$0 *because credits absorbed the charges*, so a spend-based alert would not have warned of credit exhaustion (`ASSUMPTION`: the alert type configured was spend-based; `TO BE VERIFIED`).
+- **Incident:** A real secret access key was pasted into chat; it was deactivated and deleted the same session and a second old key was removed. Rule adopted: only identifiers (ARN, account ID) are ever shared.
+- **Interview:** "I separated identity from root, deferred least-privilege with a written reason, and treated a credential leak as an incident with a postmortem, not an embarrassment."
+
+---
+
+### STEP 3 — Remote Terraform state
+- **Objective:** Make Terraform's memory survive any machine.
+- **Why now:** First `apply` must already write somewhere durable.
+- **What:** S3 bucket (versioned, all public access blocked, encrypted via backend setting) and locking.
+- **Concept:** *Simple:* a shared notebook with a "someone is writing" sign. *Engineering:* state is the mapping from code to real resource IDs; locking prevents concurrent writers corrupting it.
+- **Implementation:** Created by CLI (chicken-and-egg: Terraform cannot create the place it stores its own state): `create-bucket`, `put-bucket-versioning`, `put-public-access-block`. A DynamoDB lock table was created first, then **deleted** when `terraform init` warned `dynamodb_table is deprecated`; replaced by `use_lockfile = true` (S3-native locking).
+- **Why this:** Native locking removes a service and a cost, and the DynamoDB path is deprecated.
+- **Depends on this:** All Terraform.
+- **Breaks if wrong:** Lost or corrupted state means resources Terraform can neither update nor destroy.
+- **Verification:** `get-bucket-versioning` → `Enabled`; `get-public-access-block` → all four `true`; `terraform init` → "Successfully configured the backend s3".
+- **Mistakes:** Letting Terraform manage its own backend bucket; hardcoding secrets in backend config.
+- **Underrated detail:** Backend blocks cannot use variables. Per-environment backends need `-backend-config` flags, relevant if environments are ever split into separate states.
+- **Interview:** "I bootstrapped state by hand because it can't create itself, enabled versioning for rollback, and switched to S3-native locking when the DynamoDB method was deprecated."
+
+---
+
+### STEP 4 — Repository and working environment
+- **Objective:** A place to write and run code that survives restarts.
+- **What:** GitHub repo, then tooling (`aws`, `terraform`, `kubectl`, `helm`, `git`).
+- **Implementation:** Began in GitHub Codespaces. After the monthly free usage ran out, **all access to the Codespace was lost**, including `.tf` files that had never been committed. They were reconstructed from the record of what had been written and re-added through GitHub's web editor, then rebuilt on WSL2 Ubuntu.
+- **Underrated detail:** Uncommitted work lives on one disk. After this, the rule became "commit early".
+- **Related real defects:** a `git add -A` once committed the extracted AWS CLI installer (about 8,500 files) into the infra repo; it was removed forward and `.gitignore` extended. No secrets were involved. A stray `terraform.tfstate` (empty) and an unrelated 56 MB `argocd` CLI binary were also deleted from the tree.
+- **Interview:** "I lost an environment mid-project, recovered the code, and changed my habits: commit often, ignore build artifacts, review `git status` before committing."
+
+---
+
+### STEP 5 — Terraform scaffolding
+- **Objective:** Pin versions and define the inputs.
+- **What:** `backend.tf`, `providers.tf` (`required_version >= 1.15.0`, AWS provider `~> 5.0`, `default_tags` Project/ManagedBy/Environment), `variables.tf` (region, `project_name`, `environment` with a validation that only allows dev/staging/prod, `vpc_cidr = 10.0.0.0/16`).
+- **Concept:** *Engineering:* `~>` accepts minor updates but blocks a major-version break; `default_tags` labels every resource so cost and ownership are traceable.
+- **Verification:** `terraform fmt`, `validate` ("configuration is valid"), `init` installed the AWS provider (signed by HashiCorp).
+- **Mistakes:** Putting credentials in `.tf`; leaving provider versions unpinned.
+- **Underrated detail:** `.terraform.lock.hcl` **should** be committed; `.terraform/` (provider binaries) should not.
+- **Interview:** "I treat inputs as an untrusted boundary, so the environment variable validates its own value."
+
+---
+
+### STEP 6 — Network
+- **Objective:** A private network across three AZs with controlled outbound access.
+- **What:** VPC `10.0.0.0/16`; three public subnets (`10.0.0.0/20`, `10.0.16.0/20`, `10.0.32.0/20`) and three private (`10.0.128.0/20`, `.144.0/20`, `.160.0/20`), derived with `cidrsubnet`; AZs read from a data source; internet gateway; **three** NAT gateways with three Elastic IPs; one public route table; **one private route table per AZ**, each pointing at its own NAT.
+- **Concept:** *Simple:* nodes live in a building with no street door; each floor has its own back-door loading dock. *Engineering:* a shared NAT in one AZ makes that AZ's failure take out egress for all three.
+- **Why this:** `DESIGN DECISION` (ADR-001) 3 NATs cost about $70/month more but remove a cross-AZ single point of failure. The operator chose it knowingly.
+- **Depends on this:** Cluster, nodes, ExternalDNS, ingress.
+- **Breaks if wrong:** Missing subnet tags later break load balancer placement and Karpenter discovery.
+- **Verification:** Plan: 24 to add. `describe-vpcs` → `available`, `10.0.0.0/16`.
+- **Mistakes:** Hardcoding AZ names (accounts differ); copy-pasting three near-identical subnet blocks.
+- **Underrated detail:** `enable_dns_hostnames = true` matters for EKS; and NAT gateways bill hourly from creation (about 3×$0.045/hr).
+- **Interview:** "The AZ-per-NAT choice costs about $70 a month and removes a hidden single point of failure."
+
+---
+
+### STEP 7 — EKS control plane and IAM roles
+- **Objective:** The Kubernetes control plane, with an identity it can assume.
+- **What:** Cluster role (trusts `eks.amazonaws.com`, policy `AmazonEKSClusterPolicy`); `aws_eks_cluster` version **1.35**, subnets = all six, public **and** private endpoint, `public_access_cidrs = 0.0.0.0/0`, `authentication_mode = "API"`.
+- **Why this:** `DESIGN DECISION` Public endpoint because the operator's machine is outside the VPC with a changing IP; the real protection is IAM authentication plus RBAC, not network reachability. `KNOWN LIMITATION` it is still an open surface (Part 12).
+- **Breaks if wrong:** Cluster creation failure; or no one can authenticate.
+- **Verification:** 8 resources added; cluster creation completed in ~10m49s.
+- **Mistakes:** Interrupting cluster creation (leaves a hard-to-clean partial state).
+- **Underrated detail:** `authentication_mode` can only move forward (`CONFIG_MAP` → `API_AND_CONFIG_MAP` → `API`). Choosing `API` closed off the hybrid mode permanently, which mattered in Step 12.
+- **Interview:** "I chose the newer access-entry authentication and later learned it is one-way."
+
+---
+
+### STEP 8 — System node group
+- **Objective:** A small fixed set of machines to host cluster-critical pods.
+- **What:** Managed node group, 2 × `t3.small` (min 2, max 3), private subnets only, `max_unavailable = 1`, node role with worker, CNI, and ECR-read policies.
+- **Evolution:** Started as `t3.medium`. The node group sat in `CREATING` for 16+ minutes with `health.issues: []` and **zero instances**. The cause appeared only in the Auto Scaling Group's activity log: `InvalidParameterCombination – instance type is not eligible for Free Tier`. Changed to `t3.small`.
+- **Concept:** *Engineering:* chicken-and-egg: Karpenter needs a node to run on before it can create nodes.
+- **Verification:** `kubectl get nodes` → 2 Ready; kube-system pods Running.
+- **Mistakes:** Trusting `describe-nodegroup` health as the whole truth.
+- **Underrated detail:** The true error was one layer below EKS: `aws autoscaling describe-scaling-activities`.
+- **Interview:** "EKS said healthy; the ASG underneath said the account wasn't allowed that instance type. I check the layer below the abstraction."
+
+---
+
+### STEP 9 — Cluster access
+- **Objective:** Make `kubectl` work for the operator.
+- **What:** `aws_eks_access_entry` (type STANDARD) and `aws_eks_access_policy_association` (`AmazonEKSClusterAdminPolicy`, cluster scope) for the caller identity; `aws eks update-kubeconfig`.
+- **Evolution:** After cluster creation `kubectl` returned "the server has asked for the client to provide credentials". The documentation suggests the creator is auto-granted admin; here it was not. Fixed in Terraform, not by hand.
+- **Verification:** `list-access-entries` showed only two service entries before the fix; `kubectl get nodes` worked after.
+- **Underrated detail:** After every rebuild, the cluster endpoint hostname changes; a stale kubeconfig produces `no such host`. Re-run `update-kubeconfig`.
+- **Interview:** "I codified the missing admin grant rather than clicking it in the console."
+
+---
+
+### STEP 10 — Pod Identity agent, EBS CSI, storage class
+- **Objective:** Give pods AWS permissions without static keys; enable disks.
+- **What:** `eks-pod-identity-agent` addon; roles trusting `pods.eks.amazonaws.com` (actions `sts:AssumeRole`, `sts:TagSession`); EBS CSI role with `AmazonEBSCSIDriverPolicy`; Pod Identity association to service account `ebs-csi-controller-sa`; `aws-ebs-csi-driver` addon.
+- **Concept:** *Simple:* a visitor badge handed to a specific pod. *Engineering:* the agent injects short-lived credentials into pods whose service account is associated with a role.
+- **Underrated detail:** The `gp2` StorageClass exists after the addon installs but is **not marked default**. A PVC without a class stayed `Pending` ("no storage class is set") until it was patched. This was a manual step that was not scripted until later (Incident 8).
+- **Verification:** `get storageclass` → `gp2 (default)` after the patch; PVC `Bound`.
+- **Interview:** "A manual one-time step that wasn't scripted became an incident on the next rebuild. I now treat any hand-applied fix as unfinished until it is in code."
+
+---
+
+### STEP 11 — Karpenter prerequisites
+- **Objective:** Authorize Karpenter and make subnets discoverable.
+- **What:** AWS's official CloudFormation template (stack `Karpenter-platform-dev-eks`) creates `KarpenterNodeRole-platform-dev-eks`, **six** managed policies (EKS integration, IAM integration, interruption, node lifecycle, resource discovery, zonal shift), an SQS interruption queue and event rules. Terraform creates the controller role and attaches all six; Pod Identity association to service account `karpenter` in `kube-system`; the `karpenter.sh/discovery` tag on private subnets and the cluster security group.
+- **Why this:** `DESIGN DECISION` (ADR-007) Reuse AWS's maintained policy instead of hand-writing a security-critical one. This breaks "everything in Terraform" deliberately and introduces an ordering dependency (see the Part 4 note).
+- **Evolution (three incidents):**
+  1. First attached **three** of the six policies after reading a truncated listing → Karpenter crash-looped: `UnauthorizedOperation ... ec2:DescribeInstanceTypes`. Attached all six.
+  2. The stack exposed **no outputs**; the role ARN lookup via a data source failed. The controller role was created in Terraform instead.
+  3. Discovery tags kept disappearing across rebuilds (`no subnets found`). See Part 6 for the structural fix.
+- **Verification:** `list-stack-resources` showed the six policies; controller pod Running 1/1; logs showed controllers starting.
+- **Mistakes:** Attaching "the ones that look right"; assuming template outputs exist.
+- **Underrated detail:** A pod can be `Running` while unable to do its job. The logs (`--previous` for crash loops) are the truth.
+
+---
+
+### STEP 12 — Karpenter install, NodePool, node join
+- **Objective:** Elastic nodes that actually join the cluster.
+- **What:** Helm release (v1.14.0 at the time of observation); `EC2NodeClass` (Bottlerocket, `amiSelectorTerms: alias: bottlerocket@latest`, node role, subnet/security-group discovery selectors); `NodePool` (families t3/t4g, sizes micro/small, arch amd64/arm64, `limits.cpu: 20`, consolidation `WhenEmptyOrUnderutilized` after 30 s); an `EC2_LINUX` access entry for the node role.
+- **Evolution:**
+  1. `EC2NodeClass` without `amiSelectorTerms` was rejected (`spec.amiSelectorTerms: Required value`). The NodePool then looked "not ready" for a long time: `no dynamic nodepools found`.
+  2. With AL2023, six instances launched (real EC2 IDs, state `running`) but **never joined**. The node role needed membership in both `system:nodes` and `system:bootstrappers`; Access Entries cannot grant the latter.
+  3. Attempt to switch to `API_AND_CONFIG_MAP` failed outright (`Unsupported authentication mode update from API to API_AND_CONFIG_MAP`).
+  4. Switched to **Bottlerocket** plus an explicit `EC2_LINUX` access entry: six new nodes joined and were Ready in ~47–53 s.
+- **Why this:** Bottlerocket removes the dependency on the unavailable group, and is a stronger base OS regardless (ADR-005). `ASSUMPTION` The root cause of the AL2023 failure follows documented reports and the observed behaviour; it was not independently proven by inspecting node logs.
+- **Verification (VERIFIED):** logs `found provisionable pod(s)` → `created nodeclaim` ×6 → `launched nodeclaim` ×6, `instance-type t4g.small`; `kubectl get nodes` showed fresh nodes Ready.
+- **Underrated detail:** The NodePool limit (`cpu: 20`) is a deliberate runaway-spend guard.
+- **Interview:** "Instances were running at the AWS layer but absent from Kubernetes. I traced it to a bootstrap permission the chosen auth mode could not grant, and changed the OS rather than fighting a one-way setting."
+
+> **What You Should Understand Before Continuing**
+> The cluster has *two* identity systems: AWS IAM (who may call AWS APIs) and Kubernetes access (who may act inside the cluster). Node join failures, `kubectl` failures, and pod credential failures are all variations of getting those two to agree.
+
+---
+### STEP 13 — Ingress controller and load balancer
+- **Objective:** One public entry point.
+- **What:** NGINX Ingress Controller (AWS provider manifest) → Service type `LoadBalancer` → an AWS Network Load Balancer.
+- **Evolution:** `helm repo add` for ingress-nginx failed (`connection refused` to the GitHub Pages IP range `185.199.x.x`; plain `curl` and `ping` to those IPs failed while `google.com` worked). The manifest was applied through the **jsdelivr** mirror instead. `KNOWN LIMITATION` the reference is `@main` — an unpinned, mutable source.
+- **Verification:** Pod `1/1 Running`; `EXTERNAL-IP` showed an AWS load balancer hostname; `curl` returned `Welcome to nginx!`.
+- **Underrated detail:** The Ingress later used host-based rules, so a request to the raw load balancer hostname with no `Host` header returns `404` from NGINX's default backend. That is correct, but looks like a failure.
+- **Interview:** "One load balancer serves every app; I accepted the cost of one NLB rather than one per service."
+
+---
+
+### STEP 14 — Certificates (private CA)
+- **Objective:** TLS without a public domain.
+- **What:** cert-manager Helm chart v1.19.5 (`crds.enabled=true`, from `charts.jetstack.io`, which was reachable). Three objects: `selfsigned-root` ClusterIssuer → `platform-ca` Certificate (`isCA: true`, ECDSA 256, secret `platform-ca-secret`) → `platform-ca-issuer` ClusterIssuer (CA type). A `hello-tls` Certificate for `hello.platform.internal`.
+- **Concept:** *Simple:* build a small certificate office, then let it sign certificates. *Engineering:* a flat self-signed issuer makes unrelated roots; a root-then-issuer pair gives one trust anchor.
+- **Why this:** ADR-004 — no public domain was owned; the mechanism is identical to Let's Encrypt, only the trust anchor differs.
+- **Verification:** `Certificate READY=True`; `curl` → `SSL certificate problem: unable to get local issuer certificate`.
+- **Underrated detail (a real near-miss):** A request using `curl -k` returned a page, which *looks* like proof of TLS. It proves nothing about which certificate was served. The `ingress.yaml` also contained a stray `EOF` line (from a heredoc pasted into a web editor) that made `kubectl apply` fail, so the TLS-enabled Ingress had not applied at all when the first "success" appeared. Always validate the served certificate, not just the status code.
+- **Interview:** "I caught that `-k` was hiding a broken config; the untrusted-issuer error was the correct evidence."
+
+---
+
+### STEP 15 — Private DNS and ExternalDNS
+- **Objective:** Names that follow the load balancer automatically.
+- **What (Terraform):** Route 53 **private** zone `platform.internal` attached to the VPC; a role for ExternalDNS (`route53:ChangeResourceRecordSets` scoped to this one zone's ARN; `ListHostedZones`/`ListResourceRecordSets` on `*`); Pod Identity association for service account `external-dns` in namespace `external-dns`.
+- **What (cluster):** A hand-written ExternalDNS Deployment (image `registry.k8s.io/external-dns/external-dns:v0.20.0`) with `--source=ingress --domain-filter=platform.internal --provider=aws --aws-zone-type=private --policy=sync --registry=txt --txt-owner-id=platform-dev-eks`. It was hand-written because the Helm chart is hosted on the blocked CDN range.
+- **Why these flags:** `domain-filter` limits the blast radius; `policy=sync` deletes stale records; `registry=txt` marks ownership.
+- **Verification (VERIFIED):** Logs `CREATE hello.platform.internal A/AAAA` and TXT records, `4 record(s) were successfully updated`; `list-resource-record-sets` returned alias records to the load balancer; in-cluster `nslookup hello.platform.internal` returned the load balancer's IPs.
+- **Underrated detail:** Records created by ExternalDNS are **not in Terraform state** and block deletion of the zone (`HostedZoneNotEmpty`). See Part 13 and `pre-destroy.sh`.
+- **Interview:** "I scoped the DNS permission to one hosted zone ARN, not all of Route 53."
+
+---
+
+### STEP 16 — ArgoCD and the first Application
+- **Objective:** Git becomes the source of truth for what runs.
+- **What:** ArgoCD Helm chart (version unpinned), Service type `ClusterIP`, accessed by port-forward; an `Application` named `hello` with `automated: {prune: true, selfHeal: true}` and `CreateNamespace=true`.
+- **Why `ClusterIP`:** No TLS or auth in front of the UI yet; do not expose it publicly.
+- **Verification:** Application `Synced`/`Healthy`; `hello` pods created from the manifests.
+- **Evolution:** ArgoCD sat in `Unknown` and never picked up new files. Causes found over time: the Application only watches its configured `path` (RBAC files in another folder were never synced), and later, an authentication failure on a private repo (Step 17).
+- **Underrated detail:** `selfHeal` and `prune` mean live edits can be reverted or resources deleted when files disappear from Git. That is the point, and also the risk (emergency changes need a workflow). Never exercised here: `NOT VERIFIED`.
+- **Interview:** "Git is the desired state; ArgoCD reconciles. The trade-off is that direct cluster edits get overwritten."
+
+---
+
+### STEP 17 — Repository consolidation
+- **Objective:** One repository that shows the whole system.
+- **What:** Moved `apps/` and `cluster-config/` into `gitops/` in the main repo; re-pointed the ArgoCD Applications; the second repository was deleted afterwards.
+- **Evolution:** ArgoCD reported `failed to list refs: authentication required: Repository not found` for the (private) merged repo. A fine-grained token was generated; a multi-line `kubectl create secret` paste fragmented, and the **full token appeared in a shared chat**. The repository was made **public** instead, after confirming it held no credentials. Revocation of that token was instructed; its completion is **not recorded here** (`TO BE VERIFIED`).
+- **Why this:** `DESIGN DECISION` (ADR-006) For a solo portfolio project, a single repo is more legible than a split that matters only with multiple reviewers.
+- **Underrated detail:** Private repositories return `404`, not `403`, to unauthenticated requests.
+- **Interview:** "I audited the repo for secrets before making it public, and I treat a pasted token as burned."
+
+---
+
+### STEP 18 — Security policies
+- **Objective:** Baseline controls.
+- **What:**
+  - RBAC: `developer` ClusterRole (`get/list/watch/create/update/patch` on pods, deployments, services, ingresses, configmaps; `get/create` on pods/log and pods/exec) — **no `delete`**.
+  - NetworkPolicies in `default`: `default-deny-ingress` (empty pod selector) and `allow-ingress-nginx` (only from namespace `ingress-nginx`, TCP 80, to pods `app=hello`).
+  - Pod Security Admission labels on `default`: `enforce=baseline`, `audit=restricted`, `warn=restricted`.
+- **Verification:** `get clusterrole developer`; `get networkpolicy` shows both; `get ns default --show-labels` shows the three labels; creating pods produced `Warning: would violate PodSecurity "restricted:latest"` (**real PSS evidence**).
+- **Known gaps (important):**
+  - The ClusterRole has **no binding**. It currently grants nothing to anyone (`PARTIAL`).
+  - **NetworkPolicy enforcement is not proven and is probably not active.** During the HPA test, busybox pods in `default` fetched the `hello` service and CPU on the target pods rose accordingly. A working default-deny ingress policy should have blocked traffic from a non-`ingress-nginx` namespace. `ASSUMPTION` The VPC CNI's network-policy feature was never explicitly enabled; `TO BE VERIFIED`. Earlier documentation that said enforcement was "proven live" was wrong and has been corrected.
+- **Underrated detail:** A NetworkPolicy object existing and a NetworkPolicy being enforced are different facts; enforcement depends on the CNI.
+- **Interview:** "I found that one of my own security claims was unsupported, and I removed it. That's the part I'd want a reviewer to see."
+
+---
+
+### STEP 19 — Persistent storage claim
+- **Objective:** Prove a pod can use a disk.
+- **What:** `hello-data` PVC (1Gi, `ReadWriteOnce`, default `gp2`), mounted at `/usr/share/nginx/html/data` in the `default` Deployment.
+- **Evolution:** The PVC file was missing from the repo after the consolidation (existing only on the lost Codespace); re-created. PVC then stayed `Pending` until the default StorageClass annotation was applied (Step 10).
+- **Verification:** `Bound`.
+- **Underrated detail (`KNOWN LIMITATION`):** An EBS `ReadWriteOnce` volume attaches to **one node at a time**. Two replicas share this claim and worked only because both pods were scheduled on the same node in every observation. If scheduled on different nodes, the second would be expected to fail to attach (not tested). Also, `WaitForFirstConsumer` means the volume is not created until a pod uses it, so `Pending` with no consumer is normal.
+- **Not verified:** that data persists across a pod or node replacement.
+
+---
+
+### STEP 20 — Multiple environments
+- **Objective:** Three namespaces, independently synced.
+- **What:** `gitops/environments/{dev,staging,prod}/deployment.yaml` (nginx, 2 replicas, plus a Service) and three Applications `hello-dev`, `hello-staging`, `hello-prod`.
+- **Verification:** All `Synced`/`Healthy`; two pods Running in each.
+- **Known limitation:** The three are **identical** and are only Deployment + Service. The Ingress, certificate, NetworkPolicies, PSS labels, HPA, and PVC apply **only to `default`**. The platform does not yet enforce equivalent controls across environments, and the `default` namespace is itself used as an application environment.
+- **Interview:** "The three environments are structurally separate but not yet policy-equivalent; that's the gap I'd close first."
+
+---
+
+### STEP 21 — Metrics and HPA
+- **Objective:** Pod-level autoscaling.
+- **What:** metrics-server (release manifest `components.yaml`) patched with `--kubelet-insecure-tls`; HPA `hello`: min 2, max 10, target 50% CPU, scale-down stabilisation set to 30 s for the demo.
+- **Evolution:** The first install URL (a jsdelivr path) returned `404`; the correct source is a **release asset**, not a repo path. The same wrong URL remained in the script on a later rebuild until fixed.
+- **Why `--kubelet-insecure-tls`:** Worked around certificate verification between metrics-server and kubelets. `KNOWN LIMITATION` it disables a verification; production should use properly signed kubelet serving certificates.
+- **Verification:** `cpu: 1%/50%` (real value, not `<unknown>`).
+- **Underrated detail:** `<unknown>` for the first 1–2 minutes is normal. HPA also needs **resource requests** on the pods (set to 100m CPU / 64Mi), or percentage targets cannot be computed.
+
+---
+
+### STEP 22 — Behavioural tests (details in Part 15)
+- Zero-downtime rollout; node termination; HPA under load; Karpenter scale-up. See Part 15 for results and the cases where the first reading was misleading.
+
+---
+
+### STEP 23 — Operational automation
+- **Objective:** Make rebuild and teardown repeatable.
+- **What:**
+  - `full-rebuild.sh`: reconnects kubectl, applies the MTU workaround, ensures the Karpenter stack, installs everything in Steps 12–21, applies the StorageClass default, and prints a verification block.
+  - `pre-destroy.sh`: deletes LoadBalancer Services and Ingresses, **polls** until the load balancer is gone, clears non-NS/SOA Route 53 records, deletes Karpenter nodeclaims and waits for node termination, then runs `terraform destroy` with one retry.
+- **Why:** A direct `terraform destroy` failed with `DependencyViolation` on the internet gateway and subnets and `HostedZoneNotEmpty` on the zone, because Kubernetes controllers had created resources Terraform did not know about. Resolving it by hand took hours.
+- **Underrated detail:** `set -e` makes a script stop at the first failure. That is why a bad URL halted the rebuild script before ArgoCD was installed.
+- **Interview:** "I turned a multi-hour manual cleanup into a script, and I kept the root-cause explanation in the repo."
+
+---
+
+### STEP 24 — Documentation and evidence
+- **Objective:** Make the work reviewable.
+- **What:** `docs/` (nine files) and this README. The AWS account was subsequently closed, so evidence screenshots remain to be captured after reactivation.
+- **Underrated detail:** Writing the register above found three of my own claims to be unsupported (NetworkPolicy enforcement, RBAC use, the cost estimate relative to credit exhaustion).
+
+> **What You Should Understand Before Continuing**
+> Roughly a third of the build was diagnosis. The recurring pattern: the visible symptom (pods Pending, nodes absent, nothing syncing) was several layers above the real cause (a missing tag, a missing group, a wrong path). The skill is walking down the layers with logs, not retrying.
+
+---
+# PART 6 — How the system evolved
+
+| # | Original approach | Problem discovered | Change (removed → replaced) | What improved | Lesson |
+|---|---|---|---|---|---|
+| 1 | DynamoDB table for state locking | `terraform init` warned the parameter is deprecated | DynamoDB table → `use_lockfile = true` | Fewer moving parts, no extra service | Check deprecation warnings at first sight |
+| 2 | `t3.medium` system nodes | Free Plan allow-list; zero instances launched | `t3.medium` → `t3.small` | Nodes actually launch | The real error was one layer below EKS (ASG activity log) |
+| 3 | Assumed cluster creator gets admin | `kubectl` unauthorized | Added access entry + policy association in Terraform | Access is explicit and reproducible | Codify, don't assume defaults |
+| 4 | Three of six Karpenter policies | `UnauthorizedOperation` crash loop | Attached all six | Controller starts | Read the complete listing, not a truncated one |
+| 5 | Read role ARN from CFN stack outputs | Stack has no outputs | Data lookup → controller role created in Terraform | Ownership clearer | Verify what a template exports before depending on it |
+| 6 | `EC2NodeClass` with `amiFamily` only | Validation error | Added `amiSelectorTerms` alias | NodePool becomes valid | CRD schemas change between versions |
+| 7 | AL2023 for Karpenter nodes | Nodes ran but never joined | AL2023 → Bottlerocket, plus `EC2_LINUX` access entry | Nodes join; smaller OS | A one-way setting (`authentication_mode`) is a design input |
+| 8 | Discovery tags as separate `aws_ec2_tag` resources | Tags vanished across rebuilds three times | Standalone subnet tag resources → tag inside `aws_subnet.private` | No independent drift | A third recurrence means fix the structure, not the symptom |
+| 9 | Helm for ingress-nginx, ArgoCD, ExternalDNS | GitHub Pages IP range unreachable from WSL2 | Mirrors, vendor-hosted charts, hand-written manifest | Installs work on this network | Environment constraints belong in the scripts, with comments |
+| 10 | Two repositories (infra, GitOps) | Added friction for a solo project | Merged into one repo; Applications re-pointed | One place shows the whole system | Split when review cadence demands it, not before |
+| 11 | Private repo with ArgoCD | Authentication failure; token exposure | Repository made public | Removes credential handling | Audit for secrets *before* publishing |
+| 12 | Metrics-server via mirror path | `404` | Switched to the release asset URL | Installs | Release artifacts are not repo paths |
+| 13 | Manual `kubectl patch` of default StorageClass | Missed on rebuild; PVC stuck | Added to `full-rebuild.sh` | Rebuild is complete | Manual fixes are unfinished work |
+| 14 | `terraform destroy` directly | Dependency violations, non-empty zone | Added `pre-destroy.sh` | Teardown in one command | Controllers create resources outside Terraform |
+| 15 | Fixed `sleep 60` in teardown | Load-balancer deletion time varies | Replaced by polling with a timeout | Deterministic | Poll for state; don't guess durations |
+
+---
+
+# PART 7 — Technology decision records
+
+Format: What · Used for · Why chosen · Alternatives (why not) · Trade-offs · Production verdict · What I would use in serious production.
+
+**Amazon EKS** — Managed Kubernetes control plane. *Used for* running all workloads. *Chosen:* operating etcd and API servers myself would add work with no learning payoff here. *Alternatives:* self-managed K8s on EC2 (operational burden), ECS (simpler, but Kubernetes was the stated requirement), Fargate-only (no node-level learning). *Trade-offs:* $0.10/hr flat, **no pause button**. *Verdict:* Appropriate for production. *Serious production:* EKS, usually several clusters/accounts.
+
+**Terraform** — Declarative infrastructure as code with remote state. *Chosen:* mature, reviewable plans. *Alternatives:* CloudFormation (AWS-only, stack-centric), Pulumi/CDK (general-purpose languages; more flexible, more to reason about), OpenTofu (compatible fork). *Trade-offs:* state is a critical asset; drift in fragile resources (`aws_ec2_tag`). *Verdict:* Appropriate. *Production:* Terraform with CI-gated plans.
+
+**S3 backend with native locking** — State storage. *Alternatives:* local state (lost with the machine), Terraform Cloud (extra service). *Verdict:* Appropriate with versioning on.
+
+**VPC with per-AZ NAT** — Network isolation. *Alternatives:* one shared NAT (cheaper, SPOF), VPC endpoints/IPv6 egress (can reduce NAT dependence). *Verdict:* Appropriate for production; **over-engineered for a small hobby workload** (ADR-001).
+
+**Karpenter** — Node provisioning by pending-pod demand. *Chosen:* fast, right-sized, current direction; also the stated autoscaling requirement. *Alternatives:* Cluster Autoscaler (ASG-bound, slower), static node group (simplest). *Trade-offs:* more IAM/discovery coupling; three incidents in this build. *Verdict:* Appropriate with conditions; **over-engineered for small, predictable workloads** (ADR-002).
+
+**Bottlerocket** — Minimal container-focused OS. *Chosen:* it removed the bootstrap-group dependency that blocked AL2023 here. *Alternatives:* AL2023, Ubuntu. *Trade-offs:* fewer debugging tools on the node. *Verdict:* Appropriate.
+
+**ArgoCD** — GitOps controller. *Alternatives:* Flux (similar), CI-driven `kubectl apply` (no continuous reconciliation). *Trade-offs:* direct edits are reverted; one more control plane to secure (initial admin secret not yet deleted). *Verdict:* Appropriate.
+
+**Helm** — Package installs. *Alternatives:* raw manifests, Kustomize. *Trade-offs:* chart repos can be unreachable (they were). Used for Karpenter, cert-manager, ArgoCD. *Verdict:* Appropriate; **pin versions** (not yet done everywhere).
+
+**NGINX Ingress + AWS NLB** — Edge routing. *Alternatives:* AWS Load Balancer Controller with ALB (native, WAF integration), Gateway API. *Trade-offs:* NGINX Ingress is widely used but the project's future should be checked (`TO BE VERIFIED` against current maintenance status). *Verdict:* Appropriate with conditions.
+
+**cert-manager (private CA)** — Certificate lifecycle. *Alternatives:* manual certs, ACM (not usable for in-cluster NGINX termination directly). *Verdict:* Appropriate; the **private CA** is appropriate mainly for this project; production for public traffic needs a public CA and a real domain.
+
+**ExternalDNS + Route 53 private zone** — DNS automation. *Alternatives:* manual records. *Trade-offs:* records live outside Terraform state. *Verdict:* Appropriate.
+
+**EKS Pod Identity** — Pod-to-IAM binding. *Alternatives:* IRSA (OIDC, more setup), node role (over-broad). *Verdict:* Appropriate.
+
+**EKS Access Entries** — Cluster authentication. *Alternatives:* `aws-auth` ConfigMap (legacy). *Trade-offs:* one-way mode change; AL2023 bootstrap gap. *Verdict:* Appropriate with the caveat in Step 12.
+
+**EBS CSI driver / gp2** — Block storage. *Alternatives:* EFS (multi-node shared), gp3 (cheaper/faster). *Trade-offs:* RWO, AZ-bound. *Verdict:* Appropriate for single-writer data; **gp3 is the better default today** (`RECOMMENDATION`).
+
+**metrics-server + HPA** — Pod autoscaling on CPU. *Alternatives:* KEDA (event-driven), custom metrics. *Verdict:* Appropriate for CPU-bound workloads.
+
+**CloudFormation (Karpenter stack only)** — Reusing AWS's policy set. *Verdict:* Appropriate, with the ordering defect noted.
+
+**RBAC / NetworkPolicy / Pod Security Admission** — Built-in controls. *Verdict:* RBAC and PSA appropriate; NetworkPolicy **appropriate only once enforcement is verified**.
+
+**WSL2** — Local Linux environment. *Verdict:* Appropriate for a developer; produced network quirks (MTU, blocked CDN range).
+
+**GitHub** — Source of truth for code and manifests. *Verdict:* Appropriate.
+
+---
+
+# PART 8 — Tool defense
+
+| Tool | Role | Why used | Alternative | Why not the alternative | Production assessment |
+|---|---|---|---|---|---|
+| EKS | Control plane | Avoid operating etcd | Self-managed K8s | More work, no learning gain | Appropriate |
+| Terraform | IaC | Reviewable plans, state | CloudFormation | Less reuse across providers | Appropriate |
+| Karpenter | Node scaling | Fast, right-sized | Cluster Autoscaler | Slower, ASG-bound | Appropriate with conditions |
+| Bottlerocket | Node OS | Removed a bootstrap dependency | AL2023 | Nodes failed to join here | Appropriate |
+| ArgoCD | GitOps | Continuous reconciliation | Flux | Equivalent; chosen for UI and familiarity | Appropriate |
+| NGINX Ingress | Routing | One entry point | ALB controller | Heavier AWS coupling | Appropriate with conditions |
+| cert-manager | TLS | Automation | Manual certs | Silent expiry | Appropriate (private CA: demo-oriented) |
+| ExternalDNS | DNS | Names follow the LB | Manual records | Breaks on every rebuild | Appropriate |
+| Pod Identity | Pod IAM | No static keys | Node role | Over-broad | Appropriate |
+| EBS CSI | Storage | Dynamic volumes | EFS | Not needed for single-writer | Appropriate |
+| HPA | Pod scaling | Built in | KEDA | Not event-driven here | Appropriate |
+
+---
+
+# PART 9 — Architecture Decision Records
+
+Eight earlier records are in `docs/ADR.md`. Summary form here, plus two added after review.
+
+**ADR-001 Three NATs.** *Context:* egress resilience. *Decision:* one per AZ. *Reason:* removes a cross-AZ single point of failure. *Alternatives:* one shared NAT. *Trade-offs:* about $70/month more. *Consequences:* more resources to drift. *Production:* keep if resilience matters; drop for a small hobby workload.
+
+**ADR-002 Karpenter.** *Context:* node elasticity. *Decision:* Karpenter. *Reason:* fast, right-sized, required capability. *Alternatives:* Cluster Autoscaler, static nodes. *Trade-offs:* coupling to discovery tags and IAM. *Consequences:* three incidents. *Production:* keep for variable workloads; static group for predictable ones.
+
+**ADR-003 One cluster, three namespaces.** *Reason:* proportionate cost. *Trade-offs:* shared control plane and noisy-neighbour risk. *Production:* separate clusters/accounts for prod.
+
+**ADR-004 Private DNS and CA.** *Reason:* no public domain. *Trade-offs:* certificates untrusted outside the platform. *Production:* public CA and real domain for public traffic.
+
+**ADR-005 Bottlerocket.** *Reason:* AL2023 nodes could not join under Access Entries. *Production:* keep.
+
+**ADR-006 One repository.** *Reason:* solo, legible. *Production:* re-split when a team and CI exist.
+
+**ADR-007 Karpenter IAM from AWS's template.** *Reason:* maintained policy. *Consequence:* cross-tool ordering dependency. *Production:* keep, but codify ordering (or import policies into Terraform).
+
+**ADR-008 `terraform-cli` retains admin.** *Reason:* permissions unknown up front. *Revisit:* before a second person or a pipeline uses the account; generate a policy from CloudTrail via IAM Access Analyzer.
+
+**ADR-009 Public repository (added).** *Context:* ArgoCD could not read a private repo and a credential had just been exposed. *Decision:* make the repository public after auditing it for secrets. *Alternatives:* deploy key, GitHub App, fine-grained token. *Trade-offs:* loses privacy; gains simplicity. *Production:* a read-only deploy key or GitHub App, never a personal token.
+
+**ADR-010 Public API endpoint (added).** *Context:* operator IP not stable. *Decision:* endpoint public with `0.0.0.0/0`, protected by IAM and RBAC. *Trade-offs:* larger exposed surface. *Production:* restrict CIDRs or use private access plus a VPN or bastion.
+
+> **What You Should Understand Before Continuing**
+> Most decisions here have an honest "I would not do this at real small scale" side (three NATs, Karpenter). They were made to demonstrate production patterns, and the cost is stated, not hidden.
+
+---
+# PART 10 — AI-specific engineering
+
+**Not applicable.** This project contains no AI or machine-learning component. The documentation template assumed an AI application; this section is deliberately not filled in. (Karpenter's node selection is rule-based bin-packing, not machine learning.) Stating this is preferable to inventing an AI subsystem.
+
+---
+
+# PART 11 — Data flow and lifecycle
+
+| Data | Created | Stored | Protected | Retention / deletion | Failure behaviour |
+|---|---|---|---|---|---|
+| Terraform state | By `apply` | S3, versioned, public access blocked, encrypted | IAM; versions allow rollback | Kept; old versions retained | Corruption: restore a prior version (restore **not tested**) |
+| Manifests (desired state) | Edited by hand | Git | Repo permissions (now public) | Full history | Loss of access to Git stops deployments |
+| CA private key | By cert-manager | Kubernetes Secret `platform-ca-secret` | RBAC in-cluster; **no customer-managed KMS envelope encryption was enabled**; default at-rest protection `UNKNOWN` | Lost when the cluster is destroyed | Loss invalidates every issued certificate; **no backup exists** |
+| DNS records | By ExternalDNS | Route 53 private zone | Role scoped to one zone | Removed by `policy=sync` or by `pre-destroy.sh` | Stale records if the controller is down |
+| PVC data | By the application | EBS gp2 volume | EBS default | `Delete` reclaim policy: removed with the PVC | **No snapshots exist** (`NOT IMPLEMENTED`; the snapshot lookup attempted earlier returned no volume ID, so it was not confirmed either way) |
+| Logs | By pods | Pod log files only | None | Lost with the pod | **No central logging**; EKS control-plane logging is disabled |
+
+Where data can be lost or leaked: the CA key (no backup), PVC contents (no snapshot), audit trail (none), credentials pasted into terminals or chats (two incidents).
+
+---
+
+# PART 12 — Security
+
+*Simple:* security here is about limiting what any one broken piece can do. *Engineering:* least privilege, short-lived credentials, and explicit trust boundaries.
+
+| Mechanism | Protects against | Status |
+|---|---|---|
+| One IAM role per component | A compromised pod gaining account-wide access | CURRENT |
+| Pod Identity (short-lived credentials) | Static keys inside pods | CURRENT |
+| ExternalDNS policy scoped to one hosted zone ARN | Tampering with other DNS zones | CURRENT |
+| EKS Access Entries | Unauthenticated cluster access | CURRENT |
+| `developer` role without `delete` | Accidental destructive actions | **Defined, unbound, unused** |
+| NetworkPolicy default-deny | Lateral movement between pods | **Objects exist; enforcement NOT VERIFIED and probably inactive** |
+| Pod Security Admission `baseline` enforce | Privileged or host-access containers | Label present; `warn: restricted` verified; enforce untested |
+| Private CA TLS | Eavesdropping on traffic to the ingress | CURRENT (trust must be distributed to clients) |
+| S3 state: versioning, public block, encryption | State leakage or tampering | CURRENT |
+| NodePool `cpu: 20` limit | Runaway cost from a bug | CURRENT |
+
+**Known weaknesses, stated plainly (`KNOWN LIMITATION`):**
+- `terraform-cli` has `AdministratorAccess` (ADR-008).
+- EKS API endpoint is public to `0.0.0.0/0` (ADR-010).
+- metrics-server runs with `--kubelet-insecure-tls`.
+- ArgoCD's initial admin secret has not been deleted.
+- No image scanning, no admission policy, no secrets manager integration, no audit logging.
+- Repository is public; it contains no credentials (audited), but the AWS account ID and resource names appear in code.
+- **Credential hygiene incidents:** an AWS access key and a GitHub token were each exposed in chat during the build. The AWS key was revoked. Revocation of the GitHub token was instructed but not confirmed in this record.
+
+**Redaction rule for any published evidence:** hide the account ID where practical, any token or password, kubeconfig contents, and secrets output.
+
+---
+
+# PART 13 — Reliability and failure modes
+
+| Failure | Detection | Immediate behaviour | Recovery | User impact | Tested? |
+|---|---|---|---|---|---|
+| Node dies | Pod readiness | Pods rescheduled; Karpenter provisions a replacement | Automatic | Brief | **Yes: 101 s to 2/2** |
+| AI provider fails | N/A | N/A | N/A | N/A | Not applicable |
+| One AZ outage | None built | Unknown | Unknown | Unknown | **No** (3 AZs and 3 NATs designed for it) |
+| NAT gateway fails | None built | That AZ loses egress | Manual | Partial | No |
+| Bad deployment | Rollout status | Rolling update halts if pods never become ready | `git revert` (or `rollout undo`) | Limited | Rollout success tested; rollback **not** tested |
+| ArgoCD down | Application status | Running workloads unaffected; changes stop | Restart/repair | None to running apps | No |
+| Karpenter misconfigured | Pods Pending | No new nodes (observed three ways: missing IAM policies, missing discovery tags, missing node access) | Fix and restart | Capacity-bound | **Observed in practice** |
+| Certificate expiry | cert-manager renews automatically | N/A | Automatic | None | Not observed |
+| Terraform state damaged | Terraform errors | Cannot plan/apply | Restore prior S3 version | Delays only | Not tested |
+| CA secret lost | Certificate issuance fails | New certs fail | **No backup**; rebuild the CA and reissue everything | TLS outage | No |
+| Pod-per-node ceiling reached | Pods Pending (`Too many pods`) | No scheduling | Karpenter adds nodes if it can reason about it | Delay | Observed |
+| RWO volume with replicas on different nodes | Pod stuck creating | Second replica cannot mount | Reschedule/replace volume strategy | Reduced capacity | **Not tested** |
+| AWS account closure | Console shows "account closed" | All resources unreachable | Reactivate and rebuild | Total | **Happened** (credits exhausted) |
+
+**Classification:** *Automatically recovered:* node loss, pod restarts, certificate renewal (by design). *Manual:* everything involving Terraform, the CA secret, bad deployments. *Tolerated:* a single stuck replica. *Currently unhandled:* AZ failure behaviour, backups, observability.
+
+---
+
+# PART 14 — Observability
+
+**Current implementation:** `kubectl logs` per pod, `kubectl describe` events (genuinely useful: the HPA event log was the authoritative record of scaling), the ArgoCD UI/status, Karpenter's controller logs, and metrics-server data for HPA only. **EKS control-plane logging is disabled** (verified).
+
+**Not built:** a metrics store and dashboards, alerting, distributed tracing, central log aggregation, SLOs.
+
+*Technically wrong vs users affected:* nothing here can tell those apart. There is no request-level metric, so "a pod is crashing" and "users are failing" cannot be distinguished. `RECOMMENDATION` Add Prometheus/Grafana (or a managed equivalent), the four golden signals per service, and at least one alert based on user-facing error rate.
+
+**What should not be logged:** tokens, kubeconfig, secret values (two of those leaked through terminal output during this build).
+
+---
+
+# PART 15 — Testing
+
+| Test | What | Why | Result |
+|---|---|---|---|
+| Static checks | `terraform fmt`, `validate`, `plan` | Catch errors before they cost money | Used throughout; plan counts were verified against expectations before applying |
+| Zero-downtime rollout | Background request loop during `kubectl set image` | Prove no dropped requests | 0 non-200 of **18** requests. Valid but a small sample: each request paid a TLS handshake, so the loop ran slower than its interval |
+| Node failure | Terminate the EC2 instance behind a node hosting a `hello` pod, poll Ready count | Prove self-healing | `RESULT: PASS, 2/2 ready in 101 s`; old node absent afterwards; both replacement pods landed on the **same** new node |
+| HPA | Temporary 10% target and busybox load | Prove pod scaling | First run at 50%: CPU peaked at 49%, no scaling, correct. Second run: polling showed no replica change, which looked like failure; `describe hpa` showed `SuccessfulRescale` to 6 then 4. The controller's event log is the ground truth; a 10-second poll misses short-lived scaling |
+| Karpenter scale-up | 6 pods × 1 vCPU | Prove node elasticity | Six node claims, six instances, nodes Ready |
+| Load test (latency percentiles) | `curl` workers at 10/50/100 concurrency | Find the breaking point | **Invalid.** 100% errors and 0.0 ms at every level; every worker exited with code 49. That is consistent with an empty value in `--resolve`, i.e. the hardcoded load-balancer hostname was stale after a rebuild (`ASSUMPTION`, `TO BE VERIFIED`). Results were discarded. An earlier explanation (DNS overload) was a guess and is withdrawn |
+| NetworkPolicy block test | Request from a non-allowed namespace | Prove enforcement | **Not done properly.** The HPA load generators, from the same namespace, succeeded, which is evidence against enforcement |
+| Upgrade | Raise the EKS version | Prove upgrade path | **Not executed** (one-way operation on the only cluster) |
+| Unit/integration/E2E/security scans | | | **Not applicable / not built.** There is no application code of my own and no CI |
+
+> **What You Should Understand Before Continuing**
+> A passing result needs a valid test. Two of the results above looked like failures and were not (HPA polling, `-k` and 404/308 behaviour); one looked like data and was not (the load test). The discipline is to ask whether the *measurement* is trustworthy before interpreting the *result*.
+
+---
+# PART 16 — Performance and scalability
+
+**Current scale.** `UNKNOWN` in terms of requests per second: no valid load test exists. What is known: two fixed nodes, Karpenter allowed up to 20 vCPU in total, HPA allowed 2–10 replicas.
+
+**Bottleneck found by observation.** Pods per node, not CPU or memory. Karpenter's own log reported `"pods":"11"` allocatable on a `t4g.small`, and a scheduler event read `Too many pods` while CPU was idle. This follows AWS's per-instance network-interface limits (`ASSUMPTION` for the exact arithmetic).
+
+| Component | Scales by | Limit |
+|---|---|---|
+| Pods | HPA replicas | `maxReplicas: 10` |
+| Nodes | Karpenter | `cpu: 20` and the allowed instance sizes |
+| Ingress | Single controller pod | Not scaled; a single point of contention (`KNOWN LIMITATION`) |
+| NAT | Per-AZ | Bandwidth per gateway; not tested |
+| Storage | RWO volume | One node at a time |
+
+**What happens at the limit.** Pods go `Pending`; Karpenter either adds nodes or, if its discovery or IAM is broken, does nothing, which is how three separate incidents presented.
+
+---
+
+# PART 17 — Cost engineering
+
+**Unit prices** (recalled list prices, `TO BE VERIFIED` against the current AWS pricing pages): EKS control plane about $0.10/hr; NAT gateway about $0.045/hr each plus data processing; NLB about $0.0225/hr plus capacity units; small instances a few cents per hour; Route 53 private zone about $0.50/month.
+
+**Running cost of the full stack:** roughly **$0.30–0.35 per hour**, about $220–250 per month if left on.
+
+**What makes this expensive:** being left running. EKS and the three NAT gateways have no pause state; they only exist or are deleted.
+
+**Cost controls actually used:** destroy and rebuild between sessions; Karpenter `cpu: 20` ceiling; instance sizes restricted to small types; one NLB shared by all apps.
+**Not used:** Spot capacity, gp3 volumes, scheduled teardown, a credit-balance alarm.
+
+> **Correction to the earlier cost estimate (`docs/CAPACITY_AND_COST.md`).** That document estimated about $5–6.50 for roughly 15–20 hours of runtime, and noted that Cost Explorer showed ≈ $0 because credits absorbed charges. The account was then closed because **all Free Plan credits were used**. The credit amount is `UNKNOWN`, and the account's other workloads are `UNKNOWN`, so the estimate cannot be reconciled with the closure. Either this project consumed more than estimated, other workloads on the account consumed the rest, or both (`TO BE VERIFIED` against the billing record once the console is reachable). Treat the $5–6.50 figure as a lower-bound runtime estimate, not a measured cost.
+
+**Lesson (Incident 10).** Cost Explorer reading ≈ $0 while credits are being consumed means a spend-threshold alert never fires. Credit balance needs its own monitoring.
+
+AI-specific costs: not applicable.
+
+---
+
+# PART 18 — Deployment
+
+**Infrastructure:** `terraform apply` run by hand (no CI).
+**Applications:** `git push` → ArgoCD detects (poll, or `argocd.argoproj.io/refresh=hard` annotation) → automated sync → rolling update.
+
+```
+git push ─▶ (no CI, no scan, no build) ─▶ ArgoCD ─▶ rolling update ─▶ readiness probe ─▶ serving
+```
+
+**Health verification after a rebuild:**
+```bash
+kubectl get nodes
+kubectl get application -n argocd
+kubectl get pods -n default -n dev -n staging -n prod   # one -n at a time if your kubectl rejects repeats
+kubectl get hpa -n default
+kubectl get pvc hello-data -n default
+```
+**Rollback:** `git revert` and let ArgoCD sync (`NOT TESTED`); `kubectl rollout undo` is also available (`NOT TESTED`).
+**Unpinned inputs (`KNOWN LIMITATION`):** NGINX manifest at `@main`, ArgoCD chart, Karpenter "latest" release, Bottlerocket `@latest`, metrics-server `latest`. cert-manager (v1.19.5) and ExternalDNS (v0.20.0) are pinned.
+
+---
+
+# PART 19 — Environment management
+
+- **Local:** WSL2 Ubuntu with `aws`, `terraform`, `kubectl`, `helm`.
+- **dev/staging/prod:** three namespaces in one cluster. Manifests differ only by namespace. **They are not equivalent**: the Ingress, certificates, NetworkPolicies, PSS labels, HPA, and PVC exist only in `default`.
+- **Configuration that must never be committed:** AWS keys, GitHub tokens, kubeconfig, `*.tfstate`, ArgoCD admin password, the CA private key.
+- **Secrets:** none are stored in Git. The CA key and ArgoCD secret live only in the cluster.
+
+---
+
+# PART 20 — Repository structure
+
+```
+Production-Platform-on-Kubernetes/
+├── README.md                      this document
+├── infra/                         Terraform
+│   ├── backend.tf  providers.tf  variables.tf
+│   ├── networking.tf              VPC, subnets, NATs, routes
+│   ├── eks.tf                     cluster, node group, access, Karpenter IAM/association
+│   ├── dns.tf                     private zone, ExternalDNS role
+│   └── storage.tf                 EBS CSI role and addon
+├── gitops/
+│   ├── apps/hello/                deployment, service, ingress, certificate, networkpolicy, pvc
+│   ├── environments/{dev,staging,prod}/
+│   └── cluster-config/rbac.yaml   NOT watched by an Application; applied by script
+├── full-rebuild.sh                in-cluster installs
+├── pre-destroy.sh                 safe teardown
+└── docs/                          nine supporting documents
+```
+Note: `gitops/cluster-config/` sits outside every Application's watched `path`, so changes there are not GitOps-managed.
+
+---
+
+# PART 21 — Complete build order (condensed)
+
+1. Scope and constraints → 2. AWS identity, billing guard → 3. Remote state → 4. Repo and tooling → 5. Terraform scaffold → 6. Network → 7. EKS control plane → 8. System nodes → 9. Cluster access → 10. Pod Identity, EBS CSI → 11. Karpenter prerequisites → 12. Karpenter, NodePool, node access → 13. Ingress → 14. cert-manager → 15. DNS, ExternalDNS → 16. ArgoCD → 17. Repo consolidation → 18. Security policies → 19. Storage claim → 20. Environments → 21. metrics-server, HPA → 22. Tests → 23. Automation → 24. Documentation.
+Each step depends on those before it per Part 4.
+
+---
+
+# PART 22 — If I had to rebuild this from scratch
+
+Assume a paid AWS account, region `us-east-1`, a Linux shell, and basic tool knowledge.
+
+1. **Create and check the account.** Use a paid plan, or know the Free Plan limits (instance allow-list and credits). *Verify:* `aws sts get-caller-identity` shows a non-root user.
+2. **Install** `aws` CLI v2, `terraform` ≥ 1.15, `kubectl`, `helm`, `git`. *Verify:* each `--version`.
+3. **Create the state bucket** with versioning and public access blocked (CLI, not Terraform). *Verify:* `get-bucket-versioning` → `Enabled`.
+4. **Clone** the repo and set the bucket name in `infra/backend.tf`.
+5. **Deploy the Karpenter IAM stack first** (CloudFormation, `ClusterName=platform-dev-eks`). *Why first:* `eks.tf` references its policies and node role. This ordering is **not what the current scripts do** (`KNOWN LIMITATION`); the order here is a `RECOMMENDATION` whose success on a fresh account is `TO BE VERIFIED`.
+6. **Replace hardcoded account IDs** in `eks.tf` policy ARNs (`KNOWN LIMITATION`; should become `data.aws_caller_identity`).
+7. **`terraform init && terraform plan`.** *Verify:* a plan of roughly 50 resources, all creates, no surprises. (Observed counts were 48, 53, and 51 across revisions; the exact derivation was not recorded.)
+8. **`terraform apply`** (about 15–20 min). Do not interrupt cluster creation. *Verify:* `Apply complete`.
+9. **If on WSL2**, check MTU (1350 helped AWS calls) and whether GitHub Pages hosts are reachable.
+10. **`./full-rebuild.sh`** (about 5–8 min). *Verify:* its final block.
+11. **Verify the register's VERIFIED items** with the commands in Part 18.
+12. **Tear down** with `./pre-destroy.sh`, never plain `terraform destroy`. *Verify:* no running instances (`describe-instances`), no clusters (`eks list-clusters`).
+
+---
+# PART 23 — Knowledge checkpoints
+
+Checkpoints appear at the end of Parts 3, 5 (Step 12 and Step 24), 9, and 15. If you read only one thing before changing anything: **Terraform and Kubernetes are two separate systems that create AWS resources, and the failures live in the gap between them.**
+
+---
+
+# PART 24 — Things that look small but matter
+
+| Detail | Looks insignificant because | Actually matters because | What breaks | How handled | Production implication |
+|---|---|---|---|---|---|
+| ENI-based pod ceiling | Nodes had spare CPU | Pods per node is capped by network interfaces | `Too many pods`, Pending | Observed; Karpenter adds nodes | Include in capacity planning |
+| `aws_ec2_tag` as a separate resource | Tags are cosmetic | Karpenter finds subnets only through the tag | `no subnets found` ×3 | Tag moved inside the subnet resource | Put discovery tags in the resource that owns them |
+| `authentication_mode` is one-way | A setting | Cannot go back to hybrid | Locks out `aws-auth` workaround | Switched OS to Bottlerocket | Decide before the first cluster |
+| Access Entry vs `system:bootstrappers` | Both "give access" | AL2023 needs both groups | Instances run, never join | Bottlerocket + `EC2_LINUX` entry | Test node join on every OS/AMI change |
+| Free Plan allow-list | Appears nowhere in EKS | Fails at the EC2 API | Zero instances, no EKS error | Checked ASG activity log | Verify account-level restrictions first |
+| Resources outside Terraform | Terraform says destroy is simple | Controllers created an NLB and DNS records | `DependencyViolation`, `HostedZoneNotEmpty` | `pre-destroy.sh` | Teardown order is part of the design |
+| Stale kubeconfig | Just a hostname | Endpoint changes each rebuild | `no such host` | `update-kubeconfig` | Script it |
+| Hardcoded load-balancer hostname | Copy-pasted once | Changes each rebuild | Invalid load test | Use a lookup, not a literal | Resolve names at run time |
+| Credits mask spend | Cost showed ≈ $0 | Alerts on spend never fire | Account closed | Documented | Alert on credit balance |
+| `-k` on curl | Convenient | Hides which certificate is served | False sense of TLS success | Used the untrusted-issuer error as proof | Never accept `-k` as evidence |
+| RWO volume with multiple replicas | Works in testing | Replicas happened to co-locate | Second replica fails if scheduled apart | Not fixed | Use one PVC per replica (StatefulSet) or EFS |
+| HPA poll vs event log | Polling seemed enough | Scaling can occur between samples | False "did not scale" | Read `describe hpa` events | Trust the controller's record |
+| Helm `--wait` timeout | Looks like failure | Pods may be crash-looping underneath | Misdiagnosis | Read `logs --previous` | Always inspect the pods |
+| Unpinned versions | Convenient | Rebuild may differ from the original | Silent change | Partly pinned | Pin everything |
+| ArgoCD `path` scope | Seems repo-wide | Only that path syncs | Files never applied | Applied `rbac.yaml` directly | One Application per concern |
+
+---
+
+# PART 25 — What would change for production
+
+| Area | Current | Production | Why | Added cost/complexity | Justified here? |
+|---|---|---|---|---|---|
+| Delivery | Manual `terraform apply`; no CI | CI with plan review, image build, scan, signed artifacts | Gates before change | Pipeline upkeep | Yes, once there is custom code |
+| Observability | None beyond logs/events | Metrics, dashboards, alerts on user impact, central logs | Detect incidents | Cost, upkeep | Yes, highest priority |
+| Environments | One cluster, identical namespaces | Separate clusters or accounts; equivalent controls | Blast radius | 3× control planes | Only when prod has real traffic |
+| IAM for provisioning | Admin user | Scoped role, short-lived credentials | Limit blast radius | Policy work | Yes |
+| API endpoint | Public, `0.0.0.0/0` | Restricted CIDR or private + VPN | Reduce exposure | Network setup | Yes |
+| NetworkPolicy | Unverified enforcement | Enable and test enforcement; deny egress too | Real isolation | Policy authoring | Yes |
+| Secrets | K8s Secrets, no KMS envelope | KMS envelope encryption; secrets manager | At-rest protection | Small | Yes |
+| Audit | Disabled | Control-plane logs on | Forensics | Log cost | Yes |
+| Backups | None | EBS snapshots/AWS Backup; CA key backup | Recoverability | Storage cost | Yes if data matters |
+| Admission | None | Image and policy controls (e.g. Kyverno/Gatekeeper) | Supply-chain safety | Operational | When multiple teams deploy |
+| Scheduling | Defaults | Topology spread / anti-affinity; PodDisruptionBudgets | Survive node/AZ loss | Small | Yes |
+| Capacity | Karpenter, 3 NATs | Static group and 1 NAT for a small steady workload | Simplicity and cost | Reduces complexity | **Yes, remove complexity** |
+| TLS | Private CA | Public CA and real domain | Trust | Domain cost | Only for public traffic |
+| Versions | Partly unpinned | Pinned, reviewed updates | Reproducibility | Update process | Yes |
+| ArgoCD | Initial admin, port-forward | SSO, RBAC, secret deleted | Access control | Setup | Yes |
+
+*Kept as-is in production:* Pod Identity, Access Entries, GitOps with ArgoCD, per-component IAM, private subnets for nodes.
+
+---
+
+# PART 26 — Technical debt register
+
+| Debt | Type | Risk | Impact | Recommended change |
+|---|---|---|---|---|
+| Account ID hardcoded in policy ARNs | Known limitation | Breaks on any other account | Portability | Use `data.aws_caller_identity` |
+| CFN-before-Terraform ordering | Known limitation | Fresh-account apply fails | Reproducibility | Order the scripts, or move policies into Terraform |
+| Unpinned versions | Temporary | Rebuild differs | Reliability | Pin |
+| Legacy `kubernetes.io/ingress.class` annotation | Temporary | Deprecated | Future breakage | `ingressClassName` |
+| gp2 instead of gp3 | Temporary | Cost/performance | Minor | gp3 |
+| `--kubelet-insecure-tls` | Intentional simplification | Weaker verification | Security | Proper kubelet certs |
+| Shared RWO PVC across replicas | Known limitation | Mount failure | Availability | StatefulSet or EFS |
+| No pod anti-affinity | Known limitation | Both replicas on one node (observed) | Availability | Topology spread |
+| RBAC role unbound | Actual debt | Control is decorative | Security claim | Bind and test, or remove |
+| NetworkPolicy enforcement unproven | Actual debt | False sense of security | Security claim | Enable CNI policy, test |
+| Environments not equivalent | Known limitation | Prod untested in dev | Process | Same controls per namespace |
+| `cluster-config` outside GitOps | Known limitation | Unmanaged drift | Operations | Add an Application |
+| No CI, no monitoring, no backups | Not built | Blind operation | Reliability | Roadmap |
+| Over-engineering (3 NAT, Karpenter) | Unnecessary complexity at small scale | Cost, incidents | Cost | See Part 25 |
+| GitHub token revocation unconfirmed | Process gap | Credential remains valid | Security | Verify |
+| Initial ArgoCD admin secret kept | Temporary | Credential lingers | Security | Delete after first login |
+
+---
+
+# PART 27 — Security / reliability / scalability gap analysis
+
+| Dimension | Current system | Gap | Production requirement | Required change |
+|---|---|---|---|---|
+| Security | Per-component roles, Pod Identity | Admin provisioning user, public API, unproven network isolation, no audit trail | Least privilege, restricted access, verified isolation, logging | Scoped IAM, CIDR/VPN, enable and test policy, control-plane logs |
+| Reliability | Self-healing nodes (tested) | No AZ test, no backups, no rollback test, no alerts | Tested failure domains, recoverable data, detection | Chaos tests per AZ, snapshots, rollback drill, SLO alerts |
+| Scalability | HPA and Karpenter exist | No valid load test; ingress is one pod; pod-per-node ceiling | Known limits and headroom | Valid load test, ingress replicas, capacity model |
+| Delivery | GitOps CD | No CI, unpinned inputs | Gated, reproducible pipeline | CI with scan and pinned dependencies |
+
+---
+# PART 28 — Interview defense
+
+**What does the project do, and why did you build it?**
+It provisions a multi-AZ EKS platform from code, delivers applications through Git, and handles traffic, TLS, DNS, and autoscaling. I built it to show that I can operate a platform, not only deploy one, and I documented what broke.
+
+**What problem does it solve?**
+Repeatability. The whole stack can be rebuilt from nothing in about 20–25 minutes and torn down safely, which keeps both mistakes and cost contained.
+
+**Why is Terraform separate from ArgoCD?**
+They manage different things. Terraform owns what exists in AWS; ArgoCD owns what runs inside Kubernetes. The gap between them caused several real incidents, for example a load balancer that Kubernetes created and Terraform did not know about.
+
+**Why Karpenter instead of Cluster Autoscaler?**
+It reacts to pending pods and picks right-sized instances. It also cost me three incidents. For a small steady workload I would use a static node group.
+
+**Why three NAT gateways?**
+So one AZ's failure cannot remove egress for all three. It costs about $70/month more. For a small hobby workload, one shared NAT is the right call.
+
+**Why Bottlerocket?**
+AL2023 nodes launched but never joined, because the node role needed a group that Access Entries cannot grant. I could not downgrade the authentication mode, so I changed the OS.
+
+**How do you know TLS works?**
+`curl` without `-k` failed with "unable to get local issuer certificate", which is the correct result for an untrusted private root. `-k` alone proves nothing about which certificate was served.
+
+**How did you test failure?**
+I terminated the EC2 instance under a running pod and measured recovery: 2/2 ready in 101 seconds on a freshly provisioned node. I did not test an AZ failure.
+
+**What happened with your HPA test?**
+At the 50% target, CPU peaked at 49% and the HPA correctly did not scale. At a 10% target my polling showed no change, but `describe hpa` showed it had scaled to 6 and then 4. Controller events beat sampling.
+
+**What are the main attack surfaces?**
+The public EKS API endpoint, the admin Terraform identity, the exposed ArgoCD admin credential, and any credential pasted into a terminal or chat. I had two such leaks.
+
+**How are secrets handled?**
+No secrets are committed. The CA key and ArgoCD secret live only in the cluster, with no KMS envelope encryption and no backup.
+
+**Is your network isolation real?**
+Not proven. The policies exist, but pods in the same namespace reached the app during the HPA test despite a default-deny rule, which suggests enforcement was not active. I would enable and test the CNI's policy support before claiming isolation.
+
+**Is your RBAC real?**
+The role is defined and deliberately excludes delete, but it is not bound to anyone and was never exercised.
+
+**What happens if the database dies / the AI provider fails?**
+Not applicable: there is no database and no AI component. The equivalent stateful risks here are the Terraform state (versioned in S3) and the CA secret (no backup).
+
+**What happens if a bad deployment goes out?**
+Rolling updates stop progressing if new pods never become ready. Rollback by `git revert` or `rollout undo` is available but I did not test it.
+
+**How would you scale it?**
+Pods through HPA up to 10, nodes through Karpenter up to 20 vCPU. The binding constraint I observed was pods per node, not CPU.
+
+**How would you monitor it?**
+I did not build monitoring. I would add metrics, dashboards for the four golden signals, central logs, and an alert on user-facing error rate.
+
+**What did you intentionally not build?**
+CI, observability, backups, a public domain with a public CA, and a real multi-environment separation.
+
+**What would you change with twice the budget? What would you remove if cost became critical?**
+Twice the budget: separate clusters per environment, monitoring, backups. Critical cost: one NAT, a static node group, and teardown on a schedule.
+
+**What went wrong that you did not plan for?**
+The account itself. The Free Plan credits ran out and AWS closed the account. Cost Explorer had been showing about $0 because credits absorbed the charges, so a spend-based alert would not have warned me. I now treat credit balance as its own signal.
+
+**What would a skeptic doubt?**
+Whether it was really built. The answer is the evidence in this repository: the commit history, the verbatim error strings in `docs/INCIDENTS.md`, and, after account reactivation, fresh screenshots.
+
+---
+
+# PART 29 — Final architecture
+
+```mermaid
+flowchart TB
+    subgraph Ctl["Control paths"]
+        TF["Terraform from engineer machine"] --> S3[("S3 state, versioned")]
+        TF --> AWSR["AWS resources"]
+        Git[("GitHub: infra/ and gitops/")] -.-> Argo
+    end
+    subgraph VPC["VPC 10.0.0.0/16, three AZs"]
+        subgraph Pub["Public subnets"]
+            NLB["NLB"] --- NAT["3 NAT gateways, one per AZ"]
+        end
+        subgraph Priv["Private subnets"]
+            subgraph K["EKS cluster v1.35"]
+                Ing["NGINX Ingress"] --> App["hello pods"]
+                Argo["ArgoCD"] --> App
+                Karp["Karpenter"] --> Nodes["Bottlerocket nodes and 2 system nodes"]
+                HPA["HPA and metrics-server"] --> App
+                CM["cert-manager private CA"] --> Ing
+                EDNS["ExternalDNS"]
+                EBS["EBS CSI"] --> Vol[("EBS gp2 PVC")]
+            end
+        end
+    end
+    EDNS --> R53[("Route 53 private zone")]
+    Client(("Client")) -->|HTTPS| NLB --> Ing
+    NAT -.->|egress only| Internet(("Internet"))
+```
+
+**Component list:** see Part 3.2. **Data flow:** see Part 3.3. **Deployment flow:** Part 18.
+
+**Security boundaries:** the internet stops at the NLB; nodes are in private subnets with outbound-only access; each controller has its own IAM role; the in-cluster boundary between namespaces is **not** verified (Part 12).
+
+**External dependencies:** AWS (account in good standing, credits or a paid plan), GitHub, container registries (public ECR, `registry.k8s.io`), jsdelivr and `charts.jetstack.io` (used because the GitHub Pages range was unreachable from the dev machine), AWS's Karpenter CloudFormation template.
+
+**Critical failure points:** the AWS account state (closure happened); the S3 state bucket; the CA secret; the single ingress pod; single-AZ-sensitive resources not yet tested; the cross-tool ordering between CloudFormation and Terraform.
+
+---
+
+# PART 30 — Engineering summary
+
+**What I built.** A Terraform-defined, three-AZ EKS platform with GitOps delivery, ingress, automated TLS and DNS, node and pod autoscaling, storage, baseline security objects, and scripts to rebuild and safely tear it down.
+
+**Core problem.** Making cluster delivery reproducible and recoverable, and learning how it fails.
+
+**Major decisions.** Per-AZ NAT; Karpenter; Bottlerocket; private DNS and CA; one cluster with three namespaces; one repository; Pod Identity and Access Entries; reuse of AWS's Karpenter IAM policies.
+
+**Major trade-offs.** Resilience and realism over cost and simplicity; speed of build over completeness of controls.
+
+**Lessons.** Diagnose layer by layer; codify every manual fix; treat a third recurrence as structural; verify the measurement before the result; distrust a security claim until it is tested; watch credit balance, not just spend; commit early.
+
+**Limitations.** No CI, no observability, no backups, unproven NetworkPolicy, unbound RBAC, non-equivalent environments, no AZ failure test, no valid load test, account currently closed.
+
+**Production improvements.** Part 25.
+
+**Skills this actually demonstrates.** Infrastructure as code; Kubernetes platform assembly on EKS; GitOps; IAM design for pods and clusters; failure diagnosis across layers (EC2 → ASG → EKS → Kubernetes → controller logs); incident documentation; honest evidence handling.
+**Skills it does not demonstrate.** Operating at scale, on-call response, observability engineering, CI/CD pipeline design, security hardening verified by testing.
+
+---
+
+## Appendix A — Incidents recorded after `docs/INCIDENTS.md` was written
+
+**Incident 10 — AWS account closed.** AWS closed the account after all Free Plan credits were used. The console now shows only the closure notice. Reactivation is possible until **December 3, 2026**, after which the account and its content are permanently removed. *Root cause:* credits consumed faster than noticed; spend appeared as ≈ $0 so spend alerts could not reveal it. *Impact:* live environment and all AWS-side evidence unavailable. *Prevention:* monitor credit balance, tear down promptly, and capture evidence while the environment exists.
+
+**Incident 11 — Invalid load test.** Described in Part 15. Results discarded.
+
+**Incident 12 — Unsupported security claim.** Earlier documentation stated that NetworkPolicy blocking had been "proven live". It had not. The claim is withdrawn and the corrected status is in the register.
+
+## Appendix B — Evidence still to be captured after reactivation
+
+CloudTrail history of the build; `kubectl get nodes` across three AZs; ArgoCD with all Applications Healthy; the untrusted-issuer TLS error; ExternalDNS records in Route 53; the three behavioural tests re-run with proper output; a **valid** load test; a **NetworkPolicy block test** from a non-allowed namespace after enabling enforcement; a drift-revert test for ArgoCD self-heal; the RBAC role bound to a test user and exercised.
+
+
+# ----------------------------------------------------------
+
+
+
+
+
+
 # Atlas: Distributed Resilience Platform on GCP
 
 **Engineering case study, rebuild guide and defense notes**
