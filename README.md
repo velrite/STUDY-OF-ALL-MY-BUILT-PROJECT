@@ -1,5 +1,2003 @@
+# Enterprise Cloud Platform: Full Rebuild Guide
+
+Rebuild every phase from an empty AWS account and an empty GitHub
+Codespace, using only this file. Every config file is inline. Every step
+ends with a check that tells you whether it worked before you go on.
+
+## Read this first
+
+**What this guide is built from.** Every command and file here was run
+during the original build, except where a section says **(reconstructed)**
+or **(untested)**. Those labels mean the original was never shown in the
+chat history, or was written but never run. Treat those parts as drafts and
+verify them.
+
+**Two environments, on purpose.**
+
+| | Phase 1 | Phase 2 |
+|---|---|---|
+| Where | AWS EKS | KinD inside a GitHub Codespace |
+| Why | The original target | The AWS account closed when the free credits ran out |
+| Cost | Real money, billed hourly | Free Codespace hours |
+| Proves | Supply chain, GitOps, mesh, security, observability | HA Postgres, chaos, backup/restore |
+
+Never describe Phase 2 results as "on AWS". The node names (`ecp-phase3-*`)
+show it is KinD.
+
+**Cost warning.** EKS control plane about $0.10/hr, NAT gateway about
+$0.045/hr, each `t3.small` about $0.0208/hr. A 5-node cluster costs about
+$0.25/hr. Tear down the moment you finish a session (section 13). A
+budget alarm is step 1 for a reason: the original account closed when its
+credits ran out unnoticed.
+
+**Your AWS account.** It was closed because the free-plan credits were
+used up. You must upgrade to a paid plan (deadline December 3, 2026, after
+that the account and its content are deleted) before anything in Phase 1
+will run. Phase 2 and the CI/CD pipeline need no AWS account.
+
+**Order matters.** Sections run in dependency order. Each one lists what
+it needs from the earlier ones.
+
+---
+
+## 0. Time and shape
+
+| Part | Sections | Time (no failures) | Time (realistic) |
+|---|---|---|---|
+| Accounts and tools | 1-3 | 45 min | 1.5 hr |
+| AWS infrastructure | 4-5 | 40 min | 1.5 hr |
+| Pipeline | 6-7 | 60 min | 2 hr |
+| Cluster platform | 8-11 | 90 min | 3 hr |
+| Verify and teardown | 12-13 | 15 min | 15 min |
+| Phase 2 (KinD) | 14-15 | 2 hr | 4 hr |
+
+---
+
+## 1. Accounts, tools, local setup
+
+You need: an AWS account on a paid plan, a GitHub account, and a Linux
+shell (a Codespace works, and avoids the WSL2 DNS problems that broke
+nearly every WSL session in the original build).
+
+**If you use WSL2 instead of a Codespace**, check DNS before anything else
+and every session:
+
+```bash
+cat /etc/resolv.conf
+nslookup sts.us-east-1.amazonaws.com
+```
+
+If that fails, run these **one line at a time** (pasting them as a block
+mangled the heredoc before):
+
+```bash
+sudo tee /etc/wsl.conf > /dev/null <<'EOF'
+[network]
+generateResolvConf = false
+EOF
+sudo rm -f /etc/resolv.conf
+echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+echo "nameserver 1.1.1.1" | sudo tee -a /etc/resolv.conf
+sudo chattr +i /etc/resolv.conf
+```
+
+Then from **Windows PowerShell**: `wsl --shutdown`. Reopen the terminal and
+re-run the two check commands. The fix did not survive restarts at least
+twice, so check every session.
+
+**Install the tools** (versions are the ones that worked):
+
+| Tool | Needed for | Check |
+|---|---|---|
+| AWS CLI v2 | AWS | `aws --version` |
+| Terraform >= 1.7 | Infrastructure | `terraform version` |
+| kubectl | Everything | `kubectl version --client` |
+| Helm 3 | Chart installs | `helm version` |
+| istioctl 1.23+ | Mesh | `istioctl version --remote=false` |
+| Git, GitHub CLI (`gh`) | Repos and PRs | `gh --version` |
+| uv | Running userservice tests locally | `uv --version` |
+| Docker + kind v0.24+ | Phase 2 only | `kind version` |
+
+Istio note: the 1.30.x release warns that Kubernetes 1.31 is unsupported
+(it needs 1.32+). It ran anyway. Phase 2 used Istio 1.23.2, which supports
+1.31 cleanly.
+
+**GitHub CLI warning.** The `gh` from Ubuntu's default repo was an old
+version with a bug: `gh pr merge --squash` merged a stale commit instead of
+the branch tip. Never use `gh pr merge`. Merge with plain git (section 6).
+
+---
+
+## 2. The two repositories
+
+You need two repos, and they must stay separate.
+
+1. **Platform repo** (Terraform, baseline manifests, Helm values, docs):
+   create `enterprise-cloud-platform` on GitHub. **Make it public**, or
+   branch protection will not be enforced on the free plan.
+2. **App repo**: fork `GoogleCloudPlatform/bank-of-anthos` to your account.
+   Only the `userservice` component is used.
+
+**Fork gotchas (each cost real time):**
+- GitHub's website defaults a new PR on a fork to the **upstream** repo.
+  Always create PRs with an explicit target:
+  ```bash
+  gh pr create --repo YOURUSER/bank-of-anthos --base main \
+    --head YOURUSER:branch-name --title "..." --body "..."
+  ```
+- Actions are **disabled by default on forks**. Repo, Actions tab, enable
+  them, or Settings, Actions, General, Allow all actions.
+
+```bash
+git clone git@github.com:YOURUSER/enterprise-cloud-platform.git
+git clone git@github.com:YOURUSER/bank-of-anthos.git
+```
+
+---
+
+## 3. AWS account hardening
+
+**3.1 Billing alarm first, before creating anything.** Console, Billing,
+Budgets, Create budget, Cost budget, monthly, about $30, alerts at 50% and
+100%.
+
+**3.2 Stop using root.** Console, IAM, Users, Create user (for example
+`terraform-cli`), attach `AdministratorAccess`, **tick "Provide user access
+to the AWS Management Console"** (leaving this unticked created a user
+whose login always failed with "Authentication failed"), set a password,
+add an MFA device. Sign out of root and sign in at
+`https://ACCOUNT_ID.signin.aws.amazon.com/console`.
+
+**3.3 CLI credentials** for that user:
+
+```bash
+aws configure          # access key, secret, region us-east-1
+aws sts get-caller-identity
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+echo $ACCOUNT_ID
+```
+
+Check: `get-caller-identity` shows the IAM user ARN, not `:root`. Rotate
+the access key later (it was flagged repeatedly and never done).
+
+**3.4 Free-plan restriction.** If your account is still on the free plan,
+`t3.medium` and larger fail with `InvalidParameterCombination ... not
+eligible for Free Tier`. Everything here uses `t3.small`. A paid plan
+removes this, but the guide does not depend on it.
+
+---
+
+## 4. Terraform: three isolated stacks
+
+Layout, by blast radius and how often each changes:
+
+```
+terraform/bootstrap   state bucket + lock table. Run once. NEVER destroy.
+terraform/network     VPC, subnets, NAT.
+terraform/cluster     EKS + node group.
+```
+
+```bash
+cd enterprise-cloud-platform
+mkdir -p terraform/bootstrap terraform/network terraform/cluster
+```
+
+Every file below uses the placeholder `__ACCOUNT_ID__`. After writing all
+of them, substitute it in one go:
+
+```bash
+grep -rl __ACCOUNT_ID__ terraform | xargs sed -i "s/__ACCOUNT_ID__/$ACCOUNT_ID/g"
+```
+
+### 4.1 bootstrap (run first, local state)
+
+Why local state: you cannot store state in a bucket that does not exist
+yet.
+
+`terraform/bootstrap/main.tf`:
+
+```hcl
+terraform {
+  required_version = ">= 1.7"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.0" }
+  }
+}
+
+provider "aws" { region = "us-east-1" }
+
+resource "aws_s3_bucket" "tf_state" {
+  bucket = "ecp-terraform-state-__ACCOUNT_ID__"
+  lifecycle { prevent_destroy = true }
+}
+
+resource "aws_s3_bucket_versioning" "tf_state" {
+  bucket = aws_s3_bucket.tf_state.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "tf_state" {
+  bucket = aws_s3_bucket.tf_state.id
+  rule {
+    apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "tf_state" {
+  bucket                  = aws_s3_bucket.tf_state.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_dynamodb_table" "tf_lock" {
+  name         = "ecp-terraform-locks"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+}
+```
+
+```bash
+cd terraform/bootstrap && terraform init && terraform plan
+terraform apply          # plan must say 6 to add
+```
+
+Check: `Apply complete! Resources: 6 added`. The first original attempt
+failed with `InvalidBucketName` because the placeholder was never replaced,
+so confirm the `sed` ran:
+`grep bucket main.tf` must show your account number.
+
+### 4.2 network
+
+`terraform/network/backend.tf`:
+
+```hcl
+terraform {
+  required_version = ">= 1.7"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "~> 5.0" }
+  }
+  backend "s3" {
+    bucket         = "ecp-terraform-state-__ACCOUNT_ID__"
+    key            = "network/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "ecp-terraform-locks"
+    encrypt        = true
+  }
+}
+
+provider "aws" { region = "us-east-1" }
+```
+
+(`dynamodb_table` prints a deprecation warning in newer Terraform. It still
+works. `use_lockfile` is its replacement.)
+
+`terraform/network/variables.tf`:
+
+```hcl
+variable "project_name" { default = "enterprise-cloud-platform" }
+variable "region" { default = "us-east-1" }
+variable "vpc_cidr" { default = "10.0.0.0/16" }
+variable "azs" { default = ["us-east-1a", "us-east-1b"] }
+variable "public_subnet_cidrs" { default = ["10.0.0.0/24", "10.0.1.0/24"] }
+variable "private_subnet_cidrs" { default = ["10.0.10.0/24", "10.0.11.0/24"] }
+variable "cluster_name" { default = "ecp-cluster" }
+```
+
+`terraform/network/vpc.tf`:
+
+```hcl
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags = {
+    Name                                        = "${var.project_name}-vpc"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+  }
+}
+
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "${var.project_name}-igw" }
+}
+
+resource "aws_subnet" "public" {
+  count                   = length(var.public_subnet_cidrs)
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = var.azs[count.index]
+  map_public_ip_on_launch = true
+  tags = {
+    Name                                        = "${var.project_name}-public-${var.azs[count.index]}"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+    "kubernetes.io/role/elb"                    = "1"
+  }
+}
+
+resource "aws_subnet" "private" {
+  count             = length(var.private_subnet_cidrs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnet_cidrs[count.index]
+  availability_zone = var.azs[count.index]
+  tags = {
+    Name                                        = "${var.project_name}-private-${var.azs[count.index]}"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+    "kubernetes.io/role/internal-elb"           = "1"
+  }
+}
+
+resource "aws_eip" "nat" {
+  domain = "vpc"
+  tags   = { Name = "${var.project_name}-nat-eip" }
+}
+
+# ONE NAT gateway (deliberate cost trade-off: single point of failure for egress)
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+  tags          = { Name = "${var.project_name}-nat" }
+  depends_on    = [aws_internet_gateway.main]
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+  tags = { Name = "${var.project_name}-public-rt" }
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main.id
+  }
+  tags = { Name = "${var.project_name}-private-rt" }
+}
+
+resource "aws_route_table_association" "public" {
+  count          = length(aws_subnet.public)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private" {
+  count          = length(aws_subnet.private)
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+```
+
+`terraform/network/outputs.tf`:
+
+```hcl
+output "vpc_id" { value = aws_vpc.main.id }
+output "public_subnet_ids" { value = aws_subnet.public[*].id }
+output "private_subnet_ids" { value = aws_subnet.private[*].id }
+```
+
+```bash
+cd ../network && terraform init && terraform plan
+```
+
+Check: `Plan: 14 to add, 0 to change, 0 to destroy.` Any other number
+means a typo, so stop. Then `terraform apply`. The NAT gateway takes 1-2
+minutes.
+
+### 4.3 cluster
+
+`terraform/cluster/backend.tf` is the same as the network one with
+`key = "cluster/terraform.tfstate"`.
+
+`terraform/cluster/data.tf`:
+
+```hcl
+# Reads the network stack's outputs, so no subnet IDs are ever copy-pasted
+data "terraform_remote_state" "network" {
+  backend = "s3"
+  config = {
+    bucket = "ecp-terraform-state-__ACCOUNT_ID__"
+    key    = "network/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+
+data "aws_caller_identity" "current" {}
+```
+
+`terraform/cluster/variables.tf`:
+
+```hcl
+variable "cluster_name" { default = "ecp-cluster" }
+variable "cluster_version" { default = "1.31" }
+variable "node_instance_type" { default = "t3.small" }
+```
+
+`terraform/cluster/iam.tf`:
+
+```hcl
+resource "aws_iam_role" "cluster" {
+  name = "${var.cluster_name}-cluster-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "eks.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "cluster_policy" {
+  role       = aws_iam_role.cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
+
+resource "aws_iam_role" "node" {
+  name = "${var.cluster_name}-node-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "node_worker" {
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
+resource "aws_iam_role_policy_attachment" "node_cni" {
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+resource "aws_iam_role_policy_attachment" "node_ecr" {
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+```
+
+`terraform/cluster/eks.tf`:
+
+```hcl
+resource "aws_eks_cluster" "main" {
+  name     = var.cluster_name
+  version  = var.cluster_version
+  role_arn = aws_iam_role.cluster.arn
+
+  # Without this, the access entries below fail with
+  # "authentication mode must be API or API_AND_CONFIG_MAP".
+  # Changing it later FORCES REPLACEMENT of the cluster, so set it now.
+  access_config {
+    authentication_mode = "API_AND_CONFIG_MAP"
+  }
+
+  vpc_config {
+    subnet_ids = concat(
+      data.terraform_remote_state.network.outputs.private_subnet_ids,
+      data.terraform_remote_state.network.outputs.public_subnet_ids
+    )
+    endpoint_public_access  = true   # kubectl from a laptop; harden later
+    endpoint_private_access = true
+  }
+
+  depends_on = [aws_iam_role_policy_attachment.cluster_policy]
+}
+
+resource "aws_eks_node_group" "main" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "${var.cluster_name}-nodes"
+  node_role_arn   = aws_iam_role.node.arn
+  subnet_ids      = data.terraform_remote_state.network.outputs.private_subnet_ids
+  instance_types  = [var.node_instance_type]
+
+  scaling_config {
+    desired_size = 2
+    min_size     = 1
+    max_size     = 7
+  }
+  update_config { max_unavailable = 1 }
+
+  # You will scale with the CLI during the build; without this,
+  # the next terraform apply would shrink the group back to 2.
+  lifecycle { ignore_changes = [scaling_config[0].desired_size] }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.node_worker,
+    aws_iam_role_policy_attachment.node_cni,
+    aws_iam_role_policy_attachment.node_ecr,
+  ]
+}
+
+resource "aws_eks_addon" "vpc_cni" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "vpc-cni"
+}
+resource "aws_eks_addon" "kube_proxy" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "kube-proxy"
+}
+resource "aws_eks_addon" "coredns" {
+  cluster_name = aws_eks_cluster.main.name
+  addon_name   = "coredns"
+  depends_on   = [aws_eks_node_group.main]
+}
+
+# Without these two, you create a cluster you cannot run kubectl against.
+resource "aws_eks_access_entry" "admin" {
+  cluster_name  = aws_eks_cluster.main.name
+  principal_arn = data.aws_caller_identity.current.arn
+}
+resource "aws_eks_access_policy_association" "admin" {
+  cluster_name  = aws_eks_cluster.main.name
+  principal_arn = data.aws_caller_identity.current.arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+  access_scope { type = "cluster" }
+}
+```
+
+`terraform/cluster/outputs.tf`:
+
+```hcl
+output "cluster_name" { value = aws_eks_cluster.main.name }
+output "cluster_endpoint" { value = aws_eks_cluster.main.endpoint }
+output "cluster_ca" {
+  value     = aws_eks_cluster.main.certificate_authority[0].data
+  sensitive = true
+}
+```
+
+```bash
+cd ../cluster && terraform init && terraform plan
+```
+
+Check: **13 to add**. Apply. It takes 10-15 minutes, so do not Ctrl-C.
+Expected `Apply complete! Resources: 13 added`.
+
+**If the node group fails** with `not eligible for Free Tier`, you are on
+the free plan. Upgrade, or stay on `t3.small`.
+
+Save the state of the repo:
+
+```bash
+cd ../..
+cat > .gitignore <<'EOF'
+.terraform/
+*.tfstate
+*.tfstate.backup
+EOF
+git add . && git commit -m "terraform: bootstrap, network, cluster" && git push
+```
+
+---
+
+## 5. Connect and baseline the cluster
+
+```bash
+aws eks update-kubeconfig --region us-east-1 --name ecp-cluster
+kubectl get nodes          # all Ready before you continue
+```
+
+**Scale up now.** Everything later (ArgoCD, Rollouts, Istio, Vault,
+Kyverno, Falco, the observability stack) needs more pod slots than two
+nodes give. A `t3.small` allows **11 pods per node**: an AWS network
+interface limit, not memory or CPU. The original cluster reached 9 nodes.
+
+```bash
+aws eks update-nodegroup-config --cluster-name ecp-cluster \
+  --nodegroup-name ecp-cluster-nodes \
+  --scaling-config minSize=1,maxSize=7,desiredSize=5 --region us-east-1
+sleep 100; kubectl get nodes
+```
+
+**Baseline manifests.** In the platform repo:
+
+`k8s/baseline/namespaces.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bank-of-anthos
+  labels: { purpose: application-workloads }
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform
+  labels: { purpose: platform-tooling }
+```
+
+`k8s/baseline/default-deny-network-policy.yaml`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: bank-of-anthos
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+```
+
+> **Read before applying this.** Default-deny blocks *everything*, including
+> DNS and traffic to Istio's control plane. The AWS build did not need an
+> allow-list because the VPC CNI did not enforce policies at first (see 5.1).
+> The Phase 2 build hit three separate outages from it. If you enforce
+> policies, you must add the allow rules in section 14.5 at the same time.
+
+`k8s/baseline/rbac-readonly.yaml`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: namespace-viewer
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps"]
+    verbs: ["get", "list", "watch"]
+```
+
+```bash
+cd k8s/baseline
+kubectl apply -f namespaces.yaml --validate=false
+kubectl apply -f default-deny-network-policy.yaml --validate=false
+kubectl apply -f rbac-readonly.yaml --validate=false
+```
+
+(`--validate=false` avoids a recurring transient "failed to download
+openapi" error. It is not hiding a real problem.)
+
+### 5.1 The NetworkPolicy enforcement trap (a real security finding)
+
+A NetworkPolicy object existing does **not** mean it is enforced. On EKS
+the VPC CNI ignores policies until you opt in. In the original build, a pod
+in another namespace reached `userservice` despite default-deny.
+
+```bash
+kubectl set env daemonset aws-node -n kube-system ENABLE_NETWORK_POLICY=true
+kubectl rollout status daemonset aws-node -n kube-system
+```
+
+Prove it works, do not assume:
+
+```bash
+kubectl create namespace nettest
+kubectl run probe -n nettest --image=busybox:1.36 --restart=Never -- sleep 300
+kubectl exec -n nettest probe -- wget -qO- -T 3 http://userservice.bank-of-anthos:8080/ready
+```
+
+With enforcement on, this must **fail** (original result:
+`wget: error getting response: Connection reset by peer`). Run it again
+once `userservice` exists in section 8.
+
+---
+
+## 6. The app repo: CI/CD pipeline
+
+Work inside your `bank-of-anthos` fork. Everything is scoped to
+`src/accounts/userservice`.
+
+**First, confirm the real paths.** The original assumed `requirements.txt`
+and Python 3.11 and failed in 8 seconds. The service actually uses `uv`,
+`pyproject.toml`, `uv.lock`, Python 3.14, and `pylint`/`pytest` from the
+`dev` dependency group.
+
+```bash
+cd bank-of-anthos
+ls src/accounts/userservice
+```
+
+### 6.1 Fix the two real CVEs first
+
+```bash
+cd src/accounts/userservice
+uv lock --upgrade-package cryptography --upgrade-package pyasn1
+grep -A1 'name = "cryptography"' uv.lock    # version = "50.0.0" or higher
+grep -A1 'name = "pyasn1"' uv.lock           # version = "0.6.4" or higher
+uv sync --group dev && uv run pytest --cov=. --cov-report=term-missing
+cd ../../..
+```
+
+Check: tests pass and coverage is about 95%. The original baseline was
+**pylint 9.14/10, 95% coverage, 17 tests**. Set gates just *below* your
+measured values, never at a guessed round number.
+
+### 6.2 Test and lint workflow
+
+`.github/workflows/ci.yml`:
+
+```yaml
+name: CI - userservice
+on:
+  pull_request:
+    branches: [main]
+    paths: ['src/accounts/userservice/**']
+  push:
+    branches: [main]
+    paths: ['src/accounts/userservice/**']
+  workflow_dispatch:
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/accounts/userservice
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: '3.14'
+      - run: uv sync --group dev
+      - run: uv run pylint --fail-under=9 *.py
+      - run: uv run pytest --cov=. --cov-report=term-missing --cov-fail-under=90
+```
+
+### 6.3 Secret-scan allowlist
+
+Scanning the fork's whole git history returned 60 "leaks": Google's
+years-old demo credentials, not yours. Do not rewrite someone else's
+history. Scan the current files in the folder you own, with one documented
+exception.
+
+`.gitleaks.toml` at the **repo root**:
+
+```toml
+title = "gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "K8s secret REFERENCE (names only, no secret material) - manually verified"
+paths = [
+  '''src/accounts/userservice/k8s/base/add-private-key-volume\.yaml'''
+]
+```
+
+### 6.4 Build, scan, SBOM, sign
+
+`.github/workflows/build-scan-sign.yml`:
+
+```yaml
+name: Build, Scan, Sign - userservice
+on:
+  pull_request:
+    branches: [main]
+    paths: ['src/accounts/userservice/**']
+  push:
+    branches: [main]
+    paths: ['src/accounts/userservice/**']
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/YOURUSER/bank-of-anthos-userservice   # lowercase
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write        # keyless Cosign signing
+
+jobs:
+  secret-and-dep-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar xz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+      - name: Secret scan (owned folder, current files only)
+        run: gitleaks detect --no-git --source=src/accounts/userservice --config=.gitleaks.toml --redact -v
+      - name: Dependency scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: src/accounts/userservice
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+  build:
+    needs: secret-and-dep-scan
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: echo "tag=${{ env.IMAGE_NAME }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: src/accounts/userservice
+          push: true
+          tags: ${{ steps.tag.outputs.tag }}
+
+  image-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ needs.build.outputs.image_tag }}
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+  sbom:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: anchore/sbom-action@v0
+        with:
+          image: ${{ needs.build.outputs.image_tag }}
+          artifact-name: userservice-sbom.spdx.json
+          output-file: userservice-sbom.spdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: userservice-sbom.spdx.json
+
+  sign:
+    needs: [build, image-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: sigstore/cosign-installer@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: cosign sign --yes ${{ needs.build.outputs.image_tag }}
+```
+
+Why `ignore-unfixed: true`: the Debian base image had 23 OS-level CVEs with
+no upstream fix yet. That is not blanket suppression. The moment Debian
+ships a fix, Trivy flags it again.
+
+Why `@v0.36.0`: an invented version (`0.24.0`) failed with "unable to
+resolve action". Pin to a tag you have confirmed exists on the action's
+releases page.
+
+### 6.5 Policy gate (OPA / Conftest)
+
+`policy/deployment.rego`:
+
+```rego
+package main
+
+deny[msg] {
+    input.kind == "Deployment"
+    container := input.spec.template.spec.containers[_]
+    not container.resources.limits
+    msg := sprintf("Container '%s' must set resource limits", [container.name])
+}
+
+deny[msg] {
+    input.kind == "Deployment"
+    container := input.spec.template.spec.containers[_]
+    container.securityContext.runAsNonRoot != true
+    msg := sprintf("Container '%s' must set runAsNonRoot: true", [container.name])
+}
+
+deny[msg] {
+    input.kind == "Deployment"
+    container := input.spec.template.spec.containers[_]
+    endswith(container.image, ":latest")
+    msg := sprintf("Container '%s' must not use :latest", [container.name])
+}
+```
+
+(An earlier version indexed `containers[_]` inside a `not` expression and
+failed with `rego_unsafe_var_error`. Bind the container to a name first.)
+
+`.github/workflows/policy-check.yml`:
+
+```yaml
+name: Policy Gate - userservice
+on:
+  pull_request:
+    branches: [main]
+    paths: ['src/accounts/userservice/k8s/**', 'policy/**']
+  workflow_dispatch:
+jobs:
+  conftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install conftest
+        run: |
+          curl -sL https://github.com/open-policy-agent/conftest/releases/download/v0.56.0/conftest_0.56.0_Linux_x86_64.tar.gz | tar xz conftest
+          sudo mv conftest /usr/local/bin/
+      - run: conftest test src/accounts/userservice/k8s/base/*.yaml --policy policy/
+```
+
+Note: after section 7 the app manifest is a `Rollout`, not a `Deployment`,
+so these rules no longer match it. They pass vacuously. Add equivalent
+rules for `kind == "Rollout"` if you want the gate to mean something.
+
+### 6.6 Push through a PR, the safe way
+
+```bash
+git checkout -b ci/pipeline
+git add -A && git commit -m "ci: test, scan, sbom, sign, policy gate"
+git push -u origin ci/pipeline
+gh pr create --repo YOURUSER/bank-of-anthos --base main --head YOURUSER:ci/pipeline \
+  --title "CI pipeline" --body "Supply-chain pipeline for userservice"
+gh pr checks 1 --repo YOURUSER/bank-of-anthos
+```
+
+A workflow's `paths:` filter means a PR that only adds a workflow file does
+**not** trigger it. Start it by hand: Actions tab, pick the workflow, Run
+workflow, choose your branch.
+
+When all checks are green, merge with **plain git**:
+
+```bash
+git checkout main && git pull origin main
+git merge ci/pipeline --no-ff -m "Merge ci/pipeline"
+git push origin main
+git show origin/main:.github/workflows/build-scan-sign.yml | grep trivy-action   # confirm the merge landed
+```
+
+Branch protection (platform repo, Settings, Branches): require a pull
+request and the status checks, and set required approvals to **0**. A solo
+developer cannot approve their own PR, so approvals would block you
+forever.
+
+Check: Actions shows all five jobs green. GHCR (`github.com/YOURUSER?tab=packages`)
+lists an image tagged with the commit SHA. If the cluster later gets
+`ImagePullBackOff` with 401/403, the package is private. Make it public or
+add an `imagePullSecret`.
+
+Optional proof the signing is real:
+
+```bash
+cosign verify ghcr.io/YOURUSER/bank-of-anthos-userservice:<SHA> \
+  --certificate-identity-regexp ".*" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+---
+
+## 7. The userservice manifests (Rollout, Service, Kustomize)
+
+These live in `src/accounts/userservice/k8s/base/` in the app repo. ArgoCD
+renders them with Kustomize, so **a file that is not listed in
+`kustomization.yaml` is silently ignored**, and ArgoCD will still show
+Synced.
+
+Three things the original got wrong, each costing hours:
+1. The image field was a bare `userservice` placeholder, so every pod hit
+   `ErrImagePull`. Point it at your signed GHCR tag.
+2. A `Rollout` does **not** create a Service. Without one, pods exist but
+   DNS returns `NXDOMAIN`.
+3. The JWT secret volume needs an `items` remap, or the app cannot find
+   its key file.
+
+`rollout.yaml`:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: userservice
+  labels:
+    app: userservice
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: userservice
+  strategy:
+    canary:
+      steps:             # each step is its OWN list item
+        - setWeight: 25
+        - pause:
+            duration: 30s
+        - setWeight: 50
+        - pause:
+            duration: 30s
+        - setWeight: 100
+  template:
+    metadata:
+      labels:
+        app: userservice
+      annotations:
+        # Istio rewrites probes to its own port 15020 by default. Keep them on 8080.
+        sidecar.istio.io/rewriteAppHTTPProbers: "false"
+    spec:
+      serviceAccountName: bank-of-anthos
+      containers:
+        - name: userservice
+          image: ghcr.io/YOURUSER/bank-of-anthos-userservice:<FULL_SHA>
+          ports:
+            - name: http-server
+              containerPort: 8080
+          env:
+            - { name: VERSION, value: "dev" }
+            - { name: PORT, value: "8080" }
+            - { name: ENABLE_TRACING, value: "false" }   # GCP Cloud Trace crashes off-GCP
+            - { name: TOKEN_EXPIRY_SECONDS, value: "3600" }
+            - { name: PRIV_KEY_PATH, value: "/tmp/.ssh/privatekey" }
+            - { name: LOG_LEVEL, value: "info" }
+          envFrom:
+            - configMapRef: { name: environment-config }
+            - configMapRef: { name: accounts-db-config }
+          readinessProbe:
+            httpGet: { path: /ready, port: 8080 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /ready, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: keys, mountPath: /tmp/.ssh, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: keys
+          secret:
+            secretName: jwt-key
+            items:
+              - { key: jwtRS256.key, path: privatekey }
+              - { key: jwtRS256.key.pub, path: publickey }
+        - { name: tmp, emptyDir: {} }
+```
+
+A pod that survived only because of the probe-path fix: `/ready` is a plain
+`200 ok`, and `/healthy` does **not** exist (it returned 404 and got the
+container killed in a loop).
+
+`service.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: userservice
+  labels: { app: userservice }
+spec:
+  type: ClusterIP
+  selector: { app: userservice }
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }
+```
+
+`analysis-template.yaml` **(untested)**:
+
+The original template used a `web` metric with `result == "true"`, which
+Argo Rollouts rejected (`unrecognized character in action`). That bad
+template is what produced the real, unplanned automatic rollback. A
+corrected version was never proven. `/ready` returns plain text, not JSON,
+so the `web` provider's JSON parsing is probably the wrong tool anyway.
+Until you have Prometheus metrics for the service, **start without an
+`analysis` block**, prove the canary steps, then add an analysis against a
+Prometheus metric and confirm it rejects a bad version.
+
+`kustomization.yaml`:
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - rollout.yaml
+  - service.yaml
+components:
+  - ../../../components/accounts
+  - ../../../../components/backend-service
+```
+
+Validate **locally before pushing**. This catches silent omissions:
+
+```bash
+kubectl kustomize src/accounts/userservice/k8s/base/ | grep -E "^kind:|name: userservice"
+```
+
+Check: the output must list `kind: Rollout` and `kind: Service`. If a
+file you wrote is missing from it, the `resources:` list is wrong. Commit
+and push to `main`.
+
+---
+
+## 8. ArgoCD, Argo Rollouts, app secrets
+
+Large manifests time out when applied straight from a URL. **Download
+first, check the size, then apply from disk** with server-side apply (plain
+`apply` hits the 262KB annotation limit on ArgoCD's CRDs).
+
+```bash
+kubectl create namespace argocd
+curl -fsSL -o /tmp/argocd-install.yaml \
+  https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+ls -la /tmp/argocd-install.yaml                       # several MB, not empty
+kubectl apply -n argocd -f /tmp/argocd-install.yaml --server-side --force-conflicts
+kubectl wait --for=condition=available --timeout=300s deployment --all -n argocd
+```
+
+**Mandatory check.** The ApplicationSet CRD has been silently missing from
+an install that reported success (the controller then restarted 880
+times):
+
+```bash
+kubectl get crd | grep -i applicationset
+```
+
+If empty:
+
+```bash
+curl -fsSL -o /tmp/appset-crd.yaml https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/crds/applicationset-crd.yaml
+kubectl apply -f /tmp/appset-crd.yaml --server-side --force-conflicts
+```
+
+Argo Rollouts:
+
+```bash
+kubectl create namespace argo-rollouts
+curl -fsSL -o /tmp/argo-rollouts.yaml https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+kubectl apply -n argo-rollouts -f /tmp/argo-rollouts.yaml --server-side --force-conflicts
+kubectl wait --for=condition=available --timeout=200s deployment --all -n argo-rollouts
+kubectl get crd rollouts.argoproj.io            # must exist
+```
+
+App secrets and config. **None of this survives a cluster rebuild.**
+Recreate it every time:
+
+```bash
+kubectl create serviceaccount bank-of-anthos -n bank-of-anthos
+
+openssl genrsa -out /tmp/jwtRS256.key 4096
+openssl rsa -in /tmp/jwtRS256.key -pubout -out /tmp/jwtRS256.key.pub
+kubectl create secret generic jwt-key \
+  --from-file=jwtRS256.key=/tmp/jwtRS256.key \
+  --from-file=jwtRS256.key.pub=/tmp/jwtRS256.key.pub -n bank-of-anthos
+rm /tmp/jwtRS256.key /tmp/jwtRS256.key.pub
+
+kubectl create configmap environment-config -n bank-of-anthos \
+  --from-literal=LOCAL_ROUTING_NUM=883745000 \
+  --from-literal=PUB_KEY_PATH=/tmp/.ssh/publickey
+kubectl create configmap accounts-db-config -n bank-of-anthos \
+  --from-literal=ACCOUNTS_DB_URI=postgresql://accounts-admin:accounts-pwd@accounts-db:5432/accounts-db
+```
+
+There is no database on AWS. That URI points at nothing, and the app still
+serves `/ready`. A real database arrives in Phase 2.
+
+ArgoCD Application (`argocd-userservice-app.yaml`):
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: userservice
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/YOURUSER/bank-of-anthos.git
+    targetRevision: main
+    path: src/accounts/userservice/k8s/base
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: bank-of-anthos
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+```
+
+```bash
+kubectl apply -f argocd-userservice-app.yaml
+kubectl patch application userservice -n argocd --type merge -p '{"operation":{"sync":{}}}'
+sleep 45
+kubectl get application userservice -n argocd
+kubectl get rollout userservice -n bank-of-anthos
+kubectl get pods -n bank-of-anthos
+```
+
+Check: `Synced`/`Healthy`, Rollout `DESIRED 2 CURRENT 2 UP-TO-DATE 2 AVAILABLE 2`.
+
+**selfHeal reverts manual edits.** `kubectl set image` and `kubectl patch`
+on a live Rollout get undone. Fix things in Git, then sync.
+
+**Reading failures.** If a Rollout will not update, read the controller's
+own log first. It once silently rejected every update for hours:
+
+```bash
+kubectl logs -n argo-rollouts -l app.kubernetes.io/name=argo-rollouts --tail=30
+```
+
+---
+
+## 9. Istio (with the memory fix)
+
+The default `istiod` requests 2Gi. A `t3.small` has about 1.5GB
+allocatable, so one pod asks for more than any single node can ever give.
+**Adding nodes cannot fix this.** Shrink the request:
+
+```bash
+istioctl install --set profile=minimal \
+  --set values.pilot.resources.requests.memory=512Mi \
+  --set values.pilot.resources.requests.cpu=250m \
+  --set values.pilot.resources.limits.memory=1Gi -y
+kubectl get pods -n istio-system          # istiod 1/1 Running
+kubectl label namespace bank-of-anthos istio-injection=enabled --overwrite
+```
+
+Restart the app so pods get sidecars, then expect `2/2`:
+
+```bash
+kubectl patch rollout userservice -n bank-of-anthos --type merge \
+  -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"restartedAt\":\"$(date +%s)\"}}}}}"
+```
+
+Because ArgoCD self-heals, make lasting changes in Git. This restart
+annotation is for a one-off nudge.
+
+`istio-peer-auth.yaml`:
+
+```yaml
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata: { name: default, namespace: bank-of-anthos }
+spec: { mtls: { mode: STRICT } }
+```
+
+`istio-destination-rule.yaml`:
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: { name: userservice, namespace: bank-of-anthos }
+spec:
+  host: userservice.bank-of-anthos.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp: { maxConnections: 50 }
+      http: { http1MaxPendingRequests: 20, maxRequestsPerConnection: 10 }
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+```
+
+`istio-virtualservice.yaml`:
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: { name: userservice, namespace: bank-of-anthos }
+spec:
+  hosts: [userservice.bank-of-anthos.svc.cluster.local]
+  http:
+    - route:
+        - destination: { host: userservice.bank-of-anthos.svc.cluster.local }
+      retries: { attempts: 3, perTryTimeout: 2s, retryOn: "5xx,reset,connect-failure" }
+      timeout: 8s
+```
+
+`istio-fault-injection-test.yaml` is the same VirtualService with this added
+under the `http` item: `fault: { delay: { percentage: { value: 100 }, fixedDelay: 5s } }`.
+
+### 9.1 Prove fault injection (the only test that works)
+
+`kubectl port-forward`, and `kubectl exec` into a pod calling itself, **never
+cross the mesh**, so they always look fast. You need a separate client pod
+that has a sidecar and uses real DNS. The container is named after the **pod**,
+not the image:
+
+```bash
+kubectl apply -f istio-peer-auth.yaml -f istio-destination-rule.yaml -f istio-virtualservice.yaml
+kubectl run fault-test --image=curlimages/curl -n bank-of-anthos --restart=Never -- sleep 3600
+kubectl get pod fault-test -n bank-of-anthos        # must be 2/2 before you test
+kubectl apply -f istio-fault-injection-test.yaml; sleep 3
+kubectl exec -n bank-of-anthos fault-test -c fault-test -- \
+  curl -s -o /dev/null -w "WITH fault: %{time_total}s\n" http://userservice.bank-of-anthos.svc.cluster.local:8080/ready
+kubectl apply -f istio-virtualservice.yaml; sleep 3
+kubectl exec -n bank-of-anthos fault-test -c fault-test -- \
+  curl -s -o /dev/null -w "WITHOUT fault: %{time_total}s\n" http://userservice.bank-of-anthos.svc.cluster.local:8080/ready
+kubectl delete pod fault-test -n bank-of-anthos
+```
+
+Original result: `5.018500s` with the fault, `0.018601s` without. If
+you get `exit code 6` (cannot resolve host), the Service from section 7 is
+missing.
+
+**Known unproven:** `PeerAuthentication: STRICT` is applied, but traffic-level
+proof was never obtained (`istio_requests_total` was absent from
+Prometheus). The circuit breaker is configured but was never seen firing,
+because no test produced a real 5xx.
+
+---
+
+## 10. Security stack
+
+```bash
+helm repo add hashicorp https://helm.releases.hashicorp.com
+helm repo add kyverno https://kyverno.github.io/kyverno/
+helm repo add falcosecurity https://falcosecurity.github.io/charts
+for i in 1 2 3; do helm repo update && break; sleep 5; done    # github.io hosts are intermittently unreachable; retry
+```
+
+```bash
+kubectl create namespace vault
+helm install vault hashicorp/vault -n vault \
+  --set server.dev.enabled=true --set injector.enabled=false \
+  --set server.resources.requests.memory=128Mi --set server.resources.requests.cpu=100m \
+  --set server.resources.limits.memory=256Mi
+
+kubectl create namespace kyverno
+helm install kyverno kyverno/kyverno -n kyverno --set replicaCount=1 \
+  --set resources.requests.memory=128Mi --set resources.requests.cpu=100m
+
+kubectl create namespace falco
+helm install falco falcosecurity/falco -n falco --set driver.kind=modern_ebpf \
+  --set resources.requests.memory=128Mi --set resources.requests.cpu=100m
+```
+
+(`driver.kind=ebpf` is removed in the current chart. Use `modern_ebpf`.)
+
+`kyverno-require-limits.yaml`:
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata: { name: require-resource-limits }
+spec:
+  validationFailureAction: Audit
+  rules:
+    - name: check-resources
+      match: { any: [ { resources: { kinds: ["Pod"] } } ] }
+      validate:
+        message: "CPU and memory limits are required"
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  limits: { memory: "?*", cpu: "?*" }
+```
+
+```bash
+kubectl apply -f kyverno-require-limits.yaml
+```
+
+Vault runs in **dev mode**: in-memory and not durable. Kyverno runs in
+**Audit**, so it logs and does not block.
+
+**Falco `Pending` pods.** A DaemonSet pod is bound by `nodeAffinity` to one
+specific node. If that node is at 11 pods, adding nodes elsewhere does
+nothing. Cordon and drain *that* node:
+
+```bash
+kubectl describe pod <falco-pod> -n falco | tail -8      # look for "Too many pods"
+kubectl cordon <node>
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data --force
+kubectl uncordon <node>
+```
+
+**kube-bench** (run before and after; the numbers will match, since it
+scores node and control-plane config, which these tools do not change):
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/aquasecurity/kube-bench/main/job-eks.yaml
+sleep 45
+kubectl logs job/kube-bench | tail -40
+```
+
+Original: 12 PASS, 1 FAIL, 33 WARN. The one FAIL (`3.2.7 --eventRecordQPS`)
+cannot be fixed on EKS managed node groups without a custom launch
+template.
+
+---
+
+## 11. Observability
+
+**Install the EBS CSI driver first.** EKS does not include it. Without it
+every PVC stays `Pending` and Loki and Tempo never start. It needs an IAM
+role trusted by the cluster's OIDC provider:
+
+```bash
+OIDC_URL=$(aws eks describe-cluster --name ecp-cluster --region us-east-1 \
+  --query cluster.identity.oidc.issuer --output text)
+OIDC_ID=${OIDC_URL##*/}
+
+# The provider must exist before a role can trust it
+aws iam create-open-id-connect-provider --url "$OIDC_URL" \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 9e99a48a9960b14926bb7f3b02e22da2b0ab7280 2>/dev/null || true
+
+cat > /tmp/ebs-trust.json <<EOF
+{ "Version": "2012-10-17", "Statement": [{
+  "Effect": "Allow",
+  "Principal": { "Federated": "arn:aws:iam::${ACCOUNT_ID}:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/${OIDC_ID}" },
+  "Action": "sts:AssumeRoleWithWebIdentity",
+  "Condition": { "StringEquals": { "oidc.eks.us-east-1.amazonaws.com/id/${OIDC_ID}:sub": "system:serviceaccount:kube-system:ebs-csi-controller-sa" } }
+}] }
+EOF
+aws iam create-role --role-name AmazonEKS_EBS_CSI_DriverRole --assume-role-policy-document file:///tmp/ebs-trust.json
+aws iam attach-role-policy --role-name AmazonEKS_EBS_CSI_DriverRole \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+aws eks create-addon --cluster-name ecp-cluster --addon-name aws-ebs-csi-driver \
+  --service-account-role-arn arn:aws:iam::${ACCOUNT_ID}:role/AmazonEKS_EBS_CSI_DriverRole --region us-east-1
+sleep 60; kubectl get pods -n kube-system | grep ebs-csi
+```
+
+(The thumbprint is the commonly used root-CA value. Newer IAM no longer
+validates it for EKS. The OIDC-provider step in the original build was
+described as done, but its exact command was not recorded, so verify the
+role assumes correctly by watching PVCs bind.)
+
+Helm values and installs:
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+for i in 1 2 3; do helm repo update && break; sleep 5; done
+kubectl create namespace monitoring
+```
+
+`helm-values/kube-prom-values.yaml`:
+
+```yaml
+alertmanager: { enabled: false }     # re-enable for alerting (see Known gaps)
+prometheus:
+  prometheusSpec:
+    retention: 6h
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+grafana:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 200m, memory: 256Mi }
+kube-state-metrics:
+  resources:
+    requests: { cpu: 20m, memory: 64Mi }
+    limits: { cpu: 100m, memory: 128Mi }
+prometheus-node-exporter:
+  resources:
+    requests: { cpu: 20m, memory: 32Mi }
+    limits: { cpu: 50m, memory: 64Mi }
+```
+
+`helm-values/loki-values.yaml`:
+
+```yaml
+deploymentMode: SingleBinary
+loki:
+  auth_enabled: false
+  commonConfig: { replication_factor: 1 }
+  storage: { type: filesystem }
+  limits_config: { retention_period: 24h }
+singleBinary:
+  replicas: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+  persistence: { size: 5Gi }
+gateway: { enabled: false }
+backend: { replicas: 0 }
+read: { replicas: 0 }
+write: { replicas: 0 }
+```
+
+`helm-values/tempo-values.yaml`:
+
+```yaml
+tempo:
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+  retention: 24h
+persistence: { enabled: true, size: 5Gi }
+```
+
+`helm-values/otel-values.yaml`:
+
+```yaml
+mode: daemonset
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { cpu: 200m, memory: 128Mi }
+presets:
+  logsCollection: { enabled: true, includeCollectorLogs: false }
+config:
+  receivers:
+    otlp:
+      protocols:
+        grpc: { endpoint: 0.0.0.0:4317 }
+        http: { endpoint: 0.0.0.0:4318 }
+  exporters:
+    otlphttp/tempo: { endpoint: "http://tempo:3100", tls: { insecure: true } }
+    loki: { endpoint: "http://loki:3100/loki/api/v1/push" }
+  service:
+    pipelines:
+      traces: { receivers: [otlp], exporters: [otlphttp/tempo] }
+      logs: { receivers: [otlp], exporters: [loki] }
+```
+
+```bash
+helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring -f helm-values/kube-prom-values.yaml
+helm install loki grafana/loki -n monitoring -f helm-values/loki-values.yaml --set loki.useTestSchema=true
+helm install tempo grafana/tempo -n monitoring -f helm-values/tempo-values.yaml
+helm install otel-collector open-telemetry/opentelemetry-collector -n monitoring \
+  -f helm-values/otel-values.yaml --set image.repository=otel/opentelemetry-collector-k8s
+```
+
+The two `--set` flags are required by the chart versions used. Without
+them the install fails with a validation error. If an install fails and a
+retry says `cannot re-use a name that is still in use`, a half-failed
+release record is stuck. Clear it:
+
+```bash
+helm list -n monitoring -a
+helm uninstall <name> -n monitoring --no-hooks
+```
+
+(The chart prints a notice that `otlphttp` was renamed `otlp_http`. It
+rewrote it itself. The collector pods that crash or stay `Pending` came from
+the pod-count limit, not this.)
+
+Prove Prometheus with the **API**, not pod status:
+
+```bash
+kubectl port-forward svc/kube-prometheus-stack-prometheus -n monitoring 9090:9090 > /tmp/pf.log 2>&1 &
+for i in $(seq 1 15); do grep -q "Forwarding from" /tmp/pf.log && break; sleep 1; done   # wait for the real signal, not a sleep
+curl -s http://localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"' | sort | uniq -c
+```
+
+Original: 34 of 34 `up`. Always poll the log line. `sleep 3` raced the
+tunnel and produced a false `Connection refused` several times.
+
+---
+
+## 12. The health check: run after every startup
+
+`terraform apply` succeeding or `helm install` saying `deployed` means the
+API accepted a request, not that anything is healthy.
+
+```bash
+echo "== nodes ==";            kubectl get nodes
+echo "== NOT running (should be empty) ==";
+kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded
+echo "== CRDs that went missing before ==";
+kubectl get crd | grep -i applicationset || echo "MISSING applicationset"
+kubectl get crd rollouts.argoproj.io >/dev/null 2>&1 || echo "MISSING rollouts"
+echo "== argocd ==";           kubectl get application userservice -n argocd
+echo "== rollout ==";          kubectl get rollout userservice -n bank-of-anthos
+echo "== PVCs (all Bound) =="; kubectl get pvc -A
+echo "== netpol enforcement =="; kubectl get ds aws-node -n kube-system -o jsonpath='{.spec.template.spec.containers[0].env}' | grep -o 'ENABLE_NETWORK_POLICY[^}]*'
+```
+
+Healthy means: no non-running pods, the Rollout numbers all equal
+(`2 2 2 2`), every PVC `Bound`, and the env var shows `true`.
+
+### Prove the other claims
+
+Zero-downtime under a real drain. Test through the **Service**, not a
+single pod's port-forward. A port-forward dies with the pod you evict and
+gives 16 of 30 false failures. Run a traffic pod in the cluster that calls
+the Service ClusterIP once a second, drain a node hosting a replica, and
+count responses. Original: 39 of 40 returned 200 (the 1 failure happened
+before the drain). Requires a PodDisruptionBudget with `minAvailable: 1`.
+
+SBOM (shows the artifact is queryable, not just present):
+
+```bash
+syft ghcr.io/YOURUSER/bank-of-anthos-userservice:<SHA> | grep -i flask
+```
+
+---
+
+## 13. Teardown (every session)
+
+```bash
+cd terraform/cluster && terraform destroy -auto-approve
+cd ../network        && terraform destroy -auto-approve
+
+aws eks list-clusters --region us-east-1
+aws ec2 describe-instances --region us-east-1 \
+  --filters "Name=instance-state-name,Values=running,pending" \
+  --query 'Reservations[].Instances[].[InstanceId,InstanceType]' --output table
+aws ec2 describe-nat-gateways --region us-east-1 --filter Name=state,Values=available \
+  --query 'NatGateways[].NatGatewayId' --output table
+```
+
+All three checks must come back empty. **Never run destroy in
+`terraform/bootstrap`.** It holds Terraform's only record of what exists.
+
+Also check for **orphaned instances you did not create**. Two `t4g.small`
+instances launched by a different project's Karpenter ran for 10 days and
+burned credits. Tool: `aws cloudtrail lookup-events --lookup-attributes
+AttributeKey=ResourceName,AttributeValue=<instance-id>`. Run
+`export AWS_PAGER=""` first or the output traps you in `less`.
+
+**Rebuild next time:** sections 4.2, 4.3, then 5, 8, 9, 10, 11, in that
+order. The VPC and cluster come back from Terraform. Everything inside
+Kubernetes is gone and must be reinstalled.
+
+---
+
+## 14. Phase 2: HA database on KinD (Codespace)
+
+Run this in a GitHub Codespace (the 2-core/8GB default ran out of CPU and
+memory repeatedly, so choose a 4-core/16GB machine if available).
+
+### 14.1 Create the cluster
+
+`kind-cluster-config.yaml` **(reconstructed to match the original: 1 control
+plane, 3 workers, Kubernetes 1.31.0, cluster name `ecp-phase3`)**:
+
+```yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.31.0
+  - role: worker
+    image: kindest/node:v1.31.0
+  - role: worker
+    image: kindest/node:v1.31.0
+  - role: worker
+    image: kindest/node:v1.31.0
+```
+
+```bash
+kind create cluster --name ecp-phase3 --config kind-cluster-config.yaml
+kubectl get nodes            # 4 nodes Ready
+```
+
+KinD's default network plugin does not enforce NetworkPolicy, so you will
+not hit the section 5.1 trap here, but the three policy outages below still
+appeared in the original, which means a policy-enforcing setup was in use.
+If you do not install an enforcing CNI, skip 14.5.
+
+Then repeat, adapted from earlier sections: namespaces and baseline (5),
+the app repo manifests and secrets (7, 8), ArgoCD and Rollouts (8), Istio
+(9, use **1.23.2**), and metrics-server (needed for `kubectl top` and HPA).
+
+### 14.2 Restarting after a laptop or Codespace restart
+
+The cluster is Docker containers; a restart stops them.
+
+```bash
+docker start ecp-phase3-control-plane; sleep 20
+docker start ecp-phase3-worker ecp-phase3-worker2 ecp-phase3-worker3
+kind export kubeconfig --name ecp-phase3       # the API host port can change
+for i in $(seq 1 36); do kubectl get nodes --request-timeout=5s >/dev/null 2>&1 && break; sleep 5; done
+kubectl wait --for=condition=Ready nodes --all --timeout=180s
+for i in $(seq 1 40); do L=$(cut -d' ' -f1 /proc/loadavg); echo "load $L"; awk -v l=$L 'BEGIN{exit !(l<4)}' && break; sleep 15; done
+```
+
+Wait for load to settle before doing anything. Every pod cold-starting on
+2 cores drove load to **84** once. Applying a Rollout fix that creates a
+second ReplicaSet while the first is still alive will do the same. Scale the
+old ReplicaSet to 0 first:
+
+```bash
+kubectl scale replicaset <old-rs> -n bank-of-anthos --replicas=0
+```
+
+### 14.3 etcd (3 members)
+
+Apply `etcd-cluster.yaml` from the platform repo (it is committed there; its
+contents were never printed in the chat, so it is not reproduced here). It
+creates a 3-member StatefulSet behind a headless Service named `etcd`, so
+members are `etcd-0.etcd`, `etcd-1.etcd`, `etcd-2.etcd` on port 2379.
+
+```bash
+kubectl apply -f etcd-cluster.yaml
+kubectl exec -n bank-of-anthos etcd-0 -- etcdctl endpoint health --cluster
+```
+
+Check: all three `is healthy: successfully committed proposal`.
+
+### 14.4 Patroni (Postgres HA, Spilo 16)
+
+Apply, in order, the committed files: `patroni-full.yaml`, `patroni-rbac.yaml`,
+and the fixes in `patroni-fix-v2.yaml` / `patroni-fix-v3.yaml` where they
+apply to your state. The shape that worked:
+
+- StatefulSet `patroni`, 3 replicas, image `ghcr.io/zalando/spilo-16:3.3-p1`,
+  headless Service **with `publishNotReadyAddresses: true`** (pods must see
+  each other before they are "ready"), `sidecar.istio.io/inject: "false"`
+  on the pod template (no sidecar on the database).
+- ConfigMap env: `SCOPE=accounts-db`, `PGVERSION=16`.
+- Secret `patroni-credentials` with superuser and replication passwords.
+  The originals were lab values. Change them.
+- Readiness probe path `/readiness` (not `/primary`: that fails on every
+  replica, so only the leader would ever be Ready).
+
+Four things that broke it, in the order they appeared:
+
+1. **etcd API version.** Patroni logged
+   `Failed to get list of machines from http://etcd-0.etcd:2379/v2 ... 404`
+   and waited forever. It was talking the old etcd v2 API to a v3-only
+   etcd. Spilo reads `ETCD3_HOSTS` for the v3 API (or start etcd with
+   `--enable-v2=true`). Check which one your committed `patroni-full.yaml`
+   and `etcd-cluster.yaml` use, because the exact working setting was not
+   printed.
+2. **RBAC.** Patroni labels its own pod with the role and writes an
+   Endpoints object. That needs `get,list,patch,update,watch` on pods and
+   `get,list,create,patch,update,watch` on endpoints and configmaps.
+   Create a ServiceAccount `patroni`, a Role, a RoleBinding
+   (`patroni-rbac.yaml`), set `serviceAccountName: patroni` on the
+   StatefulSet, then **delete the pods** (the service account is not
+   hot-swappable).
+3. **Service selector.** Spilo labels the leader `spilo-role=master`. A
+   Service selecting `role: master` has no endpoints. Use:
+   ```bash
+   kubectl patch service patroni-primary -n bank-of-anthos --type=json \
+     -p='[{"op":"replace","path":"/spec/selector","value":{"app":"patroni","spilo-role":"master"}}]'
+   ```
+4. **NetworkPolicy** (14.5).
+
+Create the application role and database once (the app expects
+`accounts-admin` and `accounts-db`):
+
+```bash
+kubectl exec -n bank-of-anthos <leader-pod> -- bash -c \
+  'export PGPASSWORD=$PGPASSWORD_SUPERUSER; psql -h localhost -U postgres -c "CREATE ROLE \"accounts-admin\" LOGIN PASSWORD '"'"'accounts-pwd'"'"'" -c "CREATE DATABASE \"accounts-db\" OWNER \"accounts-admin\""'
+```
+
+Check:
+
+```bash
+kubectl exec -n bank-of-anthos patroni-0 -- patronictl -c /run/postgres.yml list
+kubectl get endpoints patroni-primary -n bank-of-anthos
+kubectl get pods -n bank-of-anthos -l app=patroni -L spilo-role
+```
+
+Expect 1 Leader and 2 Replicas (`streaming`, lag 0), an endpoint IP, and
+`spilo-role=master|replica` labels. Then point the app at it:
+
+```bash
+kubectl create configmap accounts-db-config -n bank-of-anthos \
+  --from-literal=ACCOUNTS_DB_URI=postgresql://accounts-admin:accounts-pwd@patroni-primary:5432/accounts-db \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Prove the app reaches the database for real (not just `/ready`):
+
+```bash
+kubectl exec -n bank-of-anthos <userservice-pod> -c userservice -- python3 -c \
+ "import os,psycopg2; c=psycopg2.connect(os.environ['ACCOUNTS_DB_URI']); print('DB CONNECTION: SUCCESS')"
+```
+
+### 14.5 NetworkPolicy allow rules **(reconstructed)**
+
+Default-deny blocked three things in the original, each as its own outage.
+The originals' exact files are not all in the chat, so these express the
+behavior you need:
+
+```yaml
+# DNS egress (PM-15)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-dns, namespace: bank-of-anthos }
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to: [ { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } } } ]
+      ports: [ { protocol: UDP, port: 53 }, { protocol: TCP, port: 53 } ]
+---
+# Same-namespace traffic: etcd peers, patroni to etcd, app to db (PM-16)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-same-namespace, namespace: bank-of-anthos }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: [ { from: [ { podSelector: {} } ] } ]
+  egress:  [ { to:   [ { podSelector: {} } ] } ]
+```
+
+Plus an egress rule to `istio-system` for sidecars to reach `istiod`, and
+one for Patroni to reach the Kubernetes API server.
+
+**API server rule.** The in-cluster Service IP is translated to the control
+plane container's real address, so the policy must allow that address. On
+KinD it was `172.18.0.5` port `6443`:
+
+```bash
+docker inspect ecp-phase3-control-plane --format '{{.NetworkSettings.Networks.kind.IPAddress}}'
+```
+
+**That IP can change after a restart.** If Patroni logs
+`Connection to kubernetes.default.svc.cluster.local timed out`, recheck it
+and update the policy. Prove reachability from inside a pod:
+
+```bash
+kubectl exec patroni-0 -n bank-of-anthos -- curl -sk -m 3 -o /dev/null -w "%{http_code}\n" https://<that-ip>:6443/healthz
+```
+
+(This needs `curl`. The app image has none, Spilo does.)
+
+---
+
+## 15. Phase 2: chaos, resilience, backup (remaining work)
+
+None of this was completed at the time of writing. Each experiment follows
+the same discipline: **state the hypothesis first**, run it, record the
+measurement, write the incident entry.
+
+### 15.1 Database primary kill (the success criterion)
+
+**Hypothesis:** killing the leader makes its etcd lease (about 30s) expire,
+a replica is promoted, and writes resume in 30-60s with 2 or fewer
+acknowledged rows lost (async replication, 0 lag).
+
+Create `chaos/01-patroni-failover.sh` **(untested, never completed in
+the original)**. It refuses to run if load is above 5, writes one row per
+second with a timestamp on every result, force-kills the leader, then
+computes promotion time, client-visible recovery, outage window, and lost
+rows from the writer log, and commits the evidence. Core of the logic:
+
+```bash
+#!/usr/bin/env bash
+NS=bank-of-anthos; TS=$(date +%Y%m%d-%H%M%S); WLOG=/tmp/writer-$TS.log
+LOAD=$(cut -d' ' -f1 /proc/loadavg); awk -v l=$LOAD 'BEGIN{exit !(l>5)}' && { echo "too busy: $LOAD"; exit 1; }
+LEADER=$(kubectl get pods -n $NS -l app=patroni,spilo-role=master  -o jsonpath='{.items[0].metadata.name}')
+WRITER=$(kubectl get pods -n $NS -l app=patroni,spilo-role=replica -o jsonpath='{.items[0].metadata.name}')
+PSQL='export PGPASSWORD=$PGPASSWORD_SUPERUSER; psql -h patroni-primary -U postgres -d postgres'
+kubectl exec -n $NS $WRITER -- bash -c "$PSQL -qc 'CREATE TABLE IF NOT EXISTS failover_probe(seq bigint primary key, written_at timestamptz default now())' -qc 'TRUNCATE failover_probe'"
+kubectl exec -n $NS $WRITER -- bash -c "$PSQL -qtAc 'select 1' >/dev/null && i=0; end=\$((SECONDS+240)); export PGCONNECT_TIMEOUT=2; \
+  while [ \$SECONDS -lt \$end ]; do i=\$((i+1)); \
+  if $PSQL -qtAc \"INSERT INTO failover_probe(seq) VALUES (\$i)\" >/dev/null 2>&1; then echo \"\$i \$(date +%s.%N) OK\"; else echo \"\$i \$(date +%s.%N) FAIL\"; fi; sleep 1; done" > $WLOG &
+sleep 15
+T0=$(date +%s.%N); kubectl delete pod $LEADER -n $NS --grace-period=0 --force --wait=false
+# poll until a different pod holds spilo-role=master -> promotion time
+# then: outage window = first OK after first FAIL - last OK before it
+# RPO     = acknowledged seqs (OK lines) not present in: SELECT seq FROM failover_probe
+```
+
+Record: kill to promotion, kill to first successful write (client RTO),
+outage window, rows acknowledged but missing (RPO), and time until the old
+leader rejoins as a replica. Compute these from the log with `awk`, never
+estimate them.
+
+### 15.2 The rest, in order
+
+| # | Experiment | Hypothesis to state first | How |
+|---|---|---|---|
+| 2 | etcd member kill | Losing 1 of 3 changes nothing. Losing 2 stops writes and Patroni demotes rather than risk two primaries. | `kubectl delete pod etcd-N`, then a second, watch `patronictl list` |
+| 3 | Pod kill under traffic | A PDB means no errors | Kill a `userservice` pod during in-cluster requests |
+| 4 | Node kill | Pods reschedule in under ~2 min and DB fails over with no human | `docker stop ecp-phase3-worker` |
+| 5 | Network break | The app loses the DB and recovers on heal. It also gives the circuit breaker its first real 5xx. | Chaos Mesh `NetworkChaos`. Fault-injection aborts are returned by the client sidecar and may not count toward ejection, so use a route returning a real 5xx. |
+| 6 | Disk fill | Eviction or Postgres failure at a measurable point | Fill an `emptyDir` or data volume |
+| 7 | Certificate expiry | A short-lived cert fails then renews | Simulation only: label it that way |
+| 8 | "Region" failure | The workloads survive losing 2 workers | Simulated zone loss. KinD has no real regions, so say so. |
+| 9 | Redis Sentinel | Master kill promotes a replica in seconds | 3 Redis + 3 Sentinel pods. Nothing uses Redis yet, so this is standalone. |
+
+Install Chaos Mesh only for experiments 5 and 6. The kill experiments need
+only `kubectl` and `docker`, and the extra controllers cost CPU you do not
+have on 2 cores.
+
+### 15.3 Backup and restore
+
+- **Velero + MinIO.** Run MinIO **outside** the cluster as a Docker
+  container with a bind mount under `/workspaces`. Backup storage inside
+  the cluster dies with the cluster, which defeats the purpose. KinD's
+  `local-path` storage has no snapshots, so use Velero's file-system backup
+  (`--use-node-agent`, `--default-volumes-to-fs-backup`).
+- **Full restore, timed.** Delete the cluster (`kind delete cluster --name
+  ecp-phase3`), recreate it from `kind-cluster-config.yaml`, install
+  Velero pointing at the same MinIO, restore, and stopwatch deleted to
+  serving. That number is the real RTO.
+- **Namespace and PV restore**, then a **database restore**: `pg_dump`,
+  restore into a fresh instance, compare row counts. The row difference is a
+  measured RPO.
+- Schedule a recurring backup, and a recurring restore test. A backup you
+  have never restored is not a backup.
+
+### 15.4 Still unbuilt from Phase 1
+
+- **HPA.** `metrics-server` exists on KinD. Add an HPA on the Rollout and
+  watch replica count follow CPU under in-cluster load.
+- **Alertmanager.** Disabled at install, never confirmed back on:
+  `helm upgrade kube-prometheus-stack ... --set alertmanager.enabled=true --reuse-values`.
+- **The SLO rule** (`UserServiceAvailabilityLow`). Build it on
+  `kube_pod_status_ready` and `kube_pod_owner`. A first version used
+  `kube_deployment_status_replicas_available` and returned nothing, because
+  the workload is a Rollout, not a Deployment.
+- **A drift test:** `kubectl scale` a Deployment by hand and time how long
+  ArgoCD takes to revert it.
+
+---
+
+## 16. Troubleshooting index (symptom, cause, fix)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pod `Pending`, "Too many pods", nodes not full | `t3.small` 11-pod limit (network interfaces) | Scale node group. If it is a DaemonSet, cordon/drain the specific full node. |
+| `istiod` `Pending`, "Insufficient memory" | 2Gi request exceeds one node | The 512Mi install override (section 9). More nodes will not help. |
+| PVC `Pending` | No EBS CSI driver | Section 11 |
+| App `CrashLoopBackOff` right after a Rollout rewrite | Dropped the JWT `items` remap | Section 7 |
+| Pods `ErrImagePull` with name `userservice` | Placeholder image | Real GHCR tag |
+| `NXDOMAIN` for `userservice` | No Service object | `service.yaml` and `kustomization.yaml` |
+| ArgoCD Synced but resources missing | File not in `resources:` | `kubectl kustomize` locally |
+| Rollout never updates | Controller rejects the spec (e.g. `setWeight` and `pause` in one step) | Read `argo-rollouts` controller logs |
+| Liveness probe 404 | Wrong path (`/healthy`) | `/ready` |
+| Probe timeouts via port 15020 | Istio probe rewrite | `sidecar.istio.io/rewriteAppHTTPProbers: "false"` |
+| Manual `kubectl` edit reverts | ArgoCD selfHeal | Edit Git |
+| ApplicationSet controller restarting | CRD missing | Section 8 |
+| `apply` fails on a CRD, "annotation too long" | 262KB limit | `--server-side --force-conflicts` |
+| `helm install` "name still in use" | Phantom release | `helm uninstall --no-hooks`; `helm list -a` |
+| Loki "schema_config" | Chart needs it | `--set loki.useTestSchema=true` |
+| OTel "image.repository must be set" | Chart needs it | `--set image.repository=...` |
+| `helm repo` "connection refused" on `*.github.io` | Intermittent | Retry loop |
+| `terraform`/`aws` DNS errors (WSL) | Resolver reset | Section 1 |
+| `t3.medium` rejected | Free plan | `t3.small` or paid plan |
+| Cluster created but `kubectl` forbidden | No access entry | `eks.tf` access entry and policy |
+| NetworkPolicy has no effect (EKS) | CNI not enforcing | `ENABLE_NETWORK_POLICY=true` |
+| Patroni waits on etcd, `/v2 404` | v2 vs v3 etcd API | Section 14.4 |
+| Patroni PATCH timeouts | NetworkPolicy blocks API server | 14.5, recheck control-plane IP |
+| `patroni-primary` has no endpoints | Selector `role` vs `spilo-role` | Section 14.4 |
+| Load average 80+ | Cold-starting everything on 2 cores | Wait. Scale old ReplicaSets to 0. Bigger Codespace. |
+| Fault test always fast | Port-forward or self-call, no mesh | In-mesh client pod (9.1) |
+| Port-forward `Connection refused` | `sleep` raced the tunnel | Poll the log for `Forwarding from` |
+| `gh pr merge` merged old code | Buggy CLI | Plain `git merge` |
+| PR went to the upstream repo | Fork default | `gh pr create --repo` |
+
+---
+
+## 17. Known gaps (do not claim these)
+
+- **mTLS** is configured (`STRICT`). Traffic-level proof was never obtained.
+- **Circuit breaker** is configured but was never seen firing.
+- **Falco** runs. One live detection test was inconclusive.
+- **Cosign** signatures are verified in CI only. Nothing at the cluster
+  admits or rejects by signature.
+- **Vault** is dev mode (not durable). **Kyverno** is Audit mode.
+- **One NAT gateway** (single point of failure for egress).
+- **Alertmanager** was disabled and never confirmed running.
+- **Phase 2 ran on KinD**, not AWS.
+- **Not done:** the six chaos experiments, Redis Sentinel, Velero,
+  measured RTO/RPO, HPA, and a recorded demo video.
+- **Access key rotation** for the IAM user was never completed.
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# --------------------------------------------------------------------------
 #  CODESPACE GitOps ArgoCD Platform
 
 ## What Is This Project?
