@@ -1,3 +1,1074 @@
+# Atlas: Distributed Resilience Platform on GCP — Engineering Case Study and Rebuild Guide
+
+Atlas is a distributed workload execution platform on Google Kubernetes Engine. It was built to answer one question with measurements instead of claims: **what actually happens when parts of the system fail?**
+
+This document does three jobs at once:
+
+1. **Explains** what Atlas is and why every major decision was made.
+2. **Records** every real failure hit during the build, what caused it, and how it was fixed.
+3. **Lets another engineer rebuild it** from an empty GCP project, in dependency order, with a check at the end of every step.
+
+> **This is not an AI/ML project.** There is no model serving, GPU workload, or AI service anywhere in Atlas. That is a hard constraint, not an omission.
+>
+> **Atlas is not multi-region.** Phase 13 was designed (ADR-001) and deliberately deferred (ADR-018). Nothing here claims regional failover.
+>
+> **Atlas is unrelated to the separate AWS/EKS "Enterprise Cloud Platform" project.** Do not mix their runbooks.
+
+---
+
+## Read this first
+
+### Labels used in this document
+
+| Label | Meaning |
+|---|---|
+| **VERIFIED** | Run during the original build and recorded in the repo (evidence, incident, or experiment file). |
+| **FROM REPO** | Stated in the repository README, ADRs, runbooks or CI file, but this guide did not re-run it. |
+| **(reconstructed)** | The command or file is my reconstruction of described behaviour. Verify it before trusting it. |
+| **UNKNOWN / NOT PROVIDED** | The source material does not contain it. Not invented. |
+| **KNOWN LIMITATION** | A real weakness, stated plainly. |
+
+### Sources this guide is built from
+
+The public repo `github.com/velrite/atlas` (README, `.gitlab-ci.yml`, `scripts-sync-github.sh`, `docs/runbooks/full-recovery.md`, `docs/engineering/technical-debt.md`) plus the project history. Files whose contents were **not** available when this was written, and are therefore referenced by path but **not** reproduced: everything under `terraform/`, `helm/`, `gitops/`, `policies/`, `observability/`, `workloads/` source, and `scripts/startup.sh` itself. Where this guide needs them, it says **"copy from the repo"** rather than inventing them.
+
+### Cost warning
+
+Two `e2-standard-4` nodes cost **$0.2680/hour, about $195.67/month** (list prices from the Cloud Billing Catalog API). The cluster is destroyed between sessions. Tear down when you stop (section 13). The GCP project `velrite-tf-test` also hosts unrelated clusters (Forge, Project7), so **always verify your kubectl context before acting**.
+
+### Billing state
+
+Billing on `velrite-tf-test` showed as **not enabled** the last time it was checked (TO BE VERIFIED). Phase 1 of this guide cannot run until billing is enabled.
+
+### Order matters
+
+Sections run in dependency order. Each section says what it needs from the earlier ones.
+
+---
+
+## 1. Atlas in 60 seconds (non-technical)
+
+**What is it?** A system that runs many small units of work ("jobs") across a pool of worker computers, and keeps running them correctly even when computers, networks, or software releases break.
+
+**What problem does it solve?** Running one job is easy. The hard part is staying correct while capacity and infrastructure keep changing: a worker fills up, a computer dies, a bad release ships. Atlas is a controlled lab for studying exactly that.
+
+**What does it actually do?** A client submits a job with a payload and resource needs. The platform picks a worker with room, runs the job, retries it on failure (3 attempts, then it is set aside as dead-letter), and reports the result.
+
+**Why does it matter?** Every claim is backed by a recorded experiment: a bad release rolled back by itself in 125 seconds; a deleted pod was replaced in 12 seconds; and a test exposed that a database restart **silently loses jobs**. The honest negative results are kept.
+
+**My mission:** design, build, run, deliberately break, measure and document the whole platform, including infrastructure, delivery pipeline, security, observability and chaos testing.
+
+---
+
+## 2. Engineering objective
+
+**Primary objective:** a production-shaped distributed workload execution platform on GCP, with evidence of how it behaves under failure.
+
+**Secondary objectives:** GitOps delivery; zero static cloud credentials; measurable SLOs with alerting; automatic rollback of bad releases; cost attribution; a written record of every failure.
+
+### Functional requirements
+
+- Accept jobs over HTTP (`POST /jobs`) and let clients read status (`GET /jobs/{id}`).
+- Schedule each job onto a worker **without exceeding that worker's capacity**.
+- Retry failed jobs up to 3 attempts, then dead-letter.
+- Scale workers with demand.
+
+### Non-functional requirements (only those the project actually evidences)
+
+| Property | Target / evidence |
+|---|---|
+| Safe delivery | Canary 10/25/50/100 with automatic abort on a bad release |
+| Recoverability | Pod, node and dependency failures measured (section 11) |
+| Security | No static GCP keys; default-deny network; admission policy |
+| Observability | Metrics, traces, four SLO alerts |
+| Cost visibility | Live-price attribution by namespace |
+| Auditability | ADRs, incident reports, evidence screenshots |
+
+### Constraints
+
+- No AI/ML/GPU anywhere.
+- GCP only; zonal GKE (`us-central1-a`).
+- An **organization policy blocks service-account key creation**, so no JSON keys can exist.
+- Built from Cloud Shell, sometimes from a phone terminal.
+- GitLab shared-runner minutes ran out mid-project (section 7.4).
+
+### Out of scope by design
+
+Simultaneous multi-region failure, a GCP control-plane outage, Byzantine workers, a custom distributed database. Multi-region itself is designed but not built.
+
+---
+
+## 3. System at a glance
+
+### 3.1 Architecture
+
+```
+client
+  |  POST /jobs
+  v
+atlas-api            Flask, delivered as an Argo Rollouts canary
+  |  enqueue job + W3C trace context
+  v
+Redis                key: atlas:queue:pending
+  |
+  v
+atlas-scheduler      capacity-aware best-fit, atomic capacity reservation
+  |  assign, or requeue when no worker has room
+  v
+Redis                key: atlas:queue:worker:<worker-id>
+  |
+  v
+atlas-worker         2 to 10 replicas (KEDA), 3 attempts then dead-letter
+```
+
+### 3.2 Component responsibilities
+
+| Component | What it is | Depends on | If it disappears |
+|---|---|---|---|
+| **atlas-api** | Flask service. Port 8080 on the pod, 80 on the Service. Routes: `/health`, `/ready` (checks Redis), `POST /jobs`, `GET /jobs/{id}`, `/metrics`. | Redis | No jobs can be submitted |
+| **atlas-scheduler** | Single-threaded loop. Metrics on :9090, no HTTP health route. | Redis | Jobs queue forever |
+| **atlas-worker** | Runs jobs. Reports its own capacity from memory (not cgroup metrics). Metrics on :9090. | Redis, scheduler | Jobs are assigned but never run |
+| **Redis** | Single instance, **no persistence, no auth**. Accepted single point of failure (ADR-005). | — | All queues and in-flight state vanish |
+| **Argo CD** (core mode) | Reconciles Git to the cluster, `selfHeal` on | Git, cluster | Drift is no longer corrected |
+| **Argo Rollouts** | Canary release controller | CRDs, cluster | A bad release goes to 100% |
+| **KEDA** | Scales workers on the scheduler requeue rate | Prometheus metrics | Workers stay at fixed count |
+| **Kyverno** | Admission policies | Cluster | Non-compliant pods are admitted |
+| **Google Managed Prometheus, Grafana, OTel Collector** | Metrics, dashboards, traces to Cloud Trace | GCP APIs | Blind operation |
+
+### 3.3 A real request, end to end
+
+1. Client calls `POST /jobs` on `atlas-api`. The API validates the payload.
+2. The API writes the job record to Redis (`atlas:queue:pending`) with **W3C trace context stored inside the job record**, then returns **202**.
+3. The scheduler pops the job and picks the best-fit worker with enough free capacity. It **reserves capacity atomically** (Redis `HINCRBY`) before committing the assignment.
+4. If no worker has room, the job is **requeued** and the requeue counter rises. That counter is the autoscaling signal.
+5. The job lands on `atlas:queue:worker:<worker-id>`. The worker executes it. On failure it retries up to 3 attempts, then dead-letters.
+6. A single trace spans `submit_job`, `schedule_job` and `execute_job` across all four processes. This is the end-to-end proof used after every rebuild (section 12).
+
+> **KNOWN LIMITATION:** the API returns 202 *before* the job is durable anywhere except an in-memory Redis. See INCIDENT note in section 12 and experiment 003.
+
+---
+
+## 4. Dependency graph: why this build order
+
+> ASSUMPTION: the phase numbers and names come from the repo's build-status table. The "because" reasoning is mine, derived from how the pieces depend on each other.
+
+```
+Phases 0-3   Scaffold, Terraform bootstrap, network + GKE, Artifact Registry, identity, RBAC
+     |
+Phases 4-6   Workload (api, scheduler, worker, Redis) -> Helm deploy -> GitLab CI/CD
+     |
+Phases 7-9   GitOps (Argo CD) -> observability -> SLOs + alerting
+     |
+Phases 10-11 KEDA autoscaling -> canary delivery + rollback
+     |
+Phase 12     Security hardening, policy-as-code
+     |
+Phase 13     Multi-region  (DEFERRED: ADR-001, ADR-018)
+     |
+Phases 14-15 Chaos experiments -> incident consolidation
+     |
+Phases 16-17 Load testing -> FinOps
+     |
+Phase 18     Documentation and retrospective
+```
+
+| A must exist before B | Because |
+|---|---|
+| Terraform state bucket → network/GKE | State must live somewhere before any resource is tracked |
+| Identity (WIF, impersonation) → CI | CI cannot push images without a credential, and keys are forbidden |
+| Workload → Helm chart → CI | The pipeline needs something to build and an image tag to bump |
+| CI image tag bump → Argo CD | GitOps needs Git to be the source of truth that the pipeline writes to |
+| Observability → SLOs → chaos | You cannot measure detection or recovery time without metrics |
+| SLO/metrics → KEDA | The autoscaling signal is a metric |
+| Argo Rollouts → canary rollback test | Needs a rollout controller and a deploy path |
+| Everything → chaos → incident docs | Failure findings (Redis loss) only exist after you break a running system |
+| Chaos + load + FinOps → case study | The write-up depends on measured results |
+
+**Skip observability** and chaos results become anecdotes. **Skip identity first** and CI ends up with a static key, which an org policy prevents anyway.
+
+### Knowledge checkpoint — what you should understand before continuing
+
+- Why the build is ordered around *what can be measured next*, not around technology categories.
+- Why a requeue counter (not a queue length) became the autoscaling signal (section 7.6).
+
+---
+
+## 5. Prerequisites, accounts, tools
+
+| Need | Notes |
+|---|---|
+| GCP project with **billing enabled** | Project `velrite-tf-test`. Region `us-central1`, zone `us-central1-a`. |
+| GitHub account | `github.com/velrite/atlas`, **portfolio-authoritative** |
+| GitLab account | `gitlab.com/velrite/atlas`, **runs CI** (project ID 85849930) |
+| Google Cloud Shell | Primary build console. Sessions drop mid-command (see 6.0) |
+| Tools | `gcloud`, `terraform`, `kubectl`, `helm`, `git`, Docker (CI only) |
+| Self-hosted CI runner | GCE VM `atlas-ci-runner` running runner `atlas-gce-runner` (section 7.4) |
+
+Both remotes are pushed after every commit. GitHub can move independently of GitLab, which is why the sync script rebases first (section 8).
+
+### 5.1 Identity: no static keys, two mechanisms
+
+An organization policy **blocks service-account key creation**. So:
+
+| Actor | Mechanism | Why |
+|---|---|---|
+| **Terraform** | Service-account **impersonation** | No key ever exists |
+| **GitLab CI** | **Workload Identity Federation** (OIDC, scoped to this project and branch) | CI proves who it is with a short-lived token |
+| **Pods** | **Workload Identity** (`atlas-workload-ksa` Kubernetes service account annotated to a GCP SA) | Pods get cloud access without keys |
+
+**Check (VERIFIED, evidence screenshot 21):**
+
+```bash
+gcloud iam service-accounts keys list --managed-by=user \
+  --iam-account=<terraform-service-account>
+```
+
+Expect **zero keys**. There is exactly one deliberate static secret in the project: the scoped GitHub token that CI uses to push to GitHub (ADR-011).
+
+---
+
+## 6. Build it, phase by phase
+
+> For each phase: goal, what it depends on, what to build, how to prove it, and what actually went wrong. Terraform, Helm and manifest contents are **in the repo** and are not reproduced here: copy them from the paths named. Commands marked *(reconstructed)* are generic and must be verified.
+
+### 6.0 Habits that prevent real failures
+
+These came from real incidents. Adopt them before Phase 0.
+
+1. **Pass `project_id` to Terraform explicitly, every time.** With no tfvars file, Terraform prompts interactively and *silently accepts a stray leftover value*. This once produced a plan with project equal to the literal word `yes`. `startup.sh` now rejects any plan that shows that.
+2. **Recheck `kubectl config current-context` after every credentials fetch.** Unrelated clusters live in this account.
+3. **Plan, read, then apply.** Never unattended `apply`. `teardown.sh` prints the destroy plan and never applies it.
+4. **Cloud Shell drops mid-command, including long `terraform apply` runs.** Nothing is lost server-side. Reconnect and check *real state*; do not blindly rerun.
+5. **Never claim something works without real command output.** Document false starts rather than hiding them.
+
+### Phases 0–3: scaffold, Terraform, GKE, registry, identity, RBAC
+
+| | |
+|---|---|
+| **Goal** | A reproducible, keyless GCP foundation and a running cluster |
+| **Depends on** | GCP project with billing, org policy understood |
+| **Repo paths** | `terraform/` (modules + environments), `kubernetes/`, `security/` |
+
+**What exists (FROM REPO):**
+- Terraform with a **GCS remote state** backend (ADR-002) and impersonation, no keys.
+- Zonal GKE Standard cluster **`atlas-dev`**, `us-central1-a`, 2× `e2-standard-4`.
+- Artifact Registry repository `atlas-images` in `us-central1`.
+- Workload Identity, namespace-scoped RBAC.
+
+**Do:**
+
+```bash
+cd terraform/<environment>          # (reconstructed path; copy the real layout from the repo)
+terraform init
+terraform plan -var="project_id=velrite-tf-test"     # ALWAYS explicit
+# read the plan fully, check no resource shows project = "yes"
+terraform apply -var="project_id=velrite-tf-test"
+```
+
+**Check:**
+
+```bash
+gcloud container clusters get-credentials atlas-dev --zone us-central1-a --project velrite-tf-test
+kubectl config current-context        # must be the atlas-dev context
+kubectl get nodes                     # 2 nodes Ready  (evidence 01-cluster-nodes)
+```
+
+**What went wrong here (INCIDENT-002, VERIFIED):**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pods stuck pulling images on first deploy | The **node pool's own service account** lacked read access to Artifact Registry | Grant the node pool SA `roles/artifactregistry.reader` |
+| A third node would not start | A **regional SSD quota** was too low | Request more quota, or stay at 2 nodes |
+
+**Underrated detail:** the *node pool's* service account pulls images, not the pod's Workload Identity service account. Granting the wrong identity does nothing.
+
+### Phases 4–6: workload, Helm, CI/CD
+
+| | |
+|---|---|
+| **Goal** | Three services running on the cluster, built and delivered by a pipeline |
+| **Depends on** | A cluster and a registry |
+| **Repo paths** | `workloads/` (api, scheduler, worker, shared job model, common), `helm/atlas-platform/`, `.gitlab-ci.yml` |
+
+**The design (ADR-005, FROM REPO):** API → Redis → scheduler → worker, with Redis as one in-memory instance. Redis having no persistence and no auth was an **accepted** single point of failure, to be measured rather than assumed.
+
+**Deploy:**
+
+```bash
+helm upgrade --install atlas-platform helm/atlas-platform -n <namespace> --create-namespace
+```
+(reconstructed; namespace names are in the chart values.)
+
+**Recreate the Workload Identity service account.** This is the easiest step to forget. It belongs to Phase 3 but is **in neither Terraform nor the Helm chart**. Without it, pods fail to even be created with a "service account not found" style error. `startup.sh` step 5 does it. Manually:
+
+```bash
+kubectl create serviceaccount atlas-workload-ksa -n <namespace>
+kubectl annotate serviceaccount atlas-workload-ksa -n <namespace> \
+  iam.gke.io/gcp-service-account=<gcp-sa-email>
+```
+(reconstructed; confirm exact SA and annotation against `scripts/startup.sh`.)
+
+**Check:**
+
+```bash
+kubectl get pods -n <namespace>
+# then submit one real job and confirm it completes (section 12)
+```
+
+**What went wrong here:**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Worker crashed on a bare-string payload and burned all 3 retries | `AttributeError` on every attempt: the worker assumed a JSON object | **Explicit payload validation**; the worker now fails fast with a clear error instead of consuming retries (`workloads/worker/main.py`) |
+| Concurrent scheduling over-assigned a worker | Capacity was read from a periodic heartbeat, so decisions used stale numbers | **Atomic reservation** via Redis `HINCRBY` at the moment of assignment (INCIDENT-001) |
+| OpenTelemetry Flask instrumentation failed to import `pkg_resources` | `setuptools` 82 removed it. First fix had no upper bound and resolved to 84.0.0, which also lacks it | **Pin setuptools below 82** (INCIDENT-004) |
+
+### Phase 6 detail: the CI/CD pipeline (real file)
+
+See section 7 for the pipeline; the whole `.gitlab-ci.yml` is in the repo root.
+
+### Phases 7–9: GitOps, observability, SLOs
+
+| | |
+|---|---|
+| **Goal** | Git as the source of truth; know whether the system is healthy; alert on user-visible trouble |
+| **Depends on** | A deployable chart and a pipeline that writes the image tag into Git |
+| **Repo paths** | `gitops/` (Argo CD Application + AppProject), `observability/`, ADR-014 and ADR-015 |
+
+**GitOps:**
+- Argo CD is installed in **core mode**. Core mode does **not** auto-create the default AppProject, so `startup.sh` applies it, then applies the Application manifest.
+- Automated sync with `selfHeal`. A worker manually scaled to 3 outside Git was **reverted by the first check, at 3 seconds** (VERIFIED).
+
+**Core-mode gotcha (VERIFIED):** `argocd app sync` fails with a "configmap not found" error in core mode. Auto-sync catches up on its own polling interval anyway. To force it immediately, patch the Application with the **hard-refresh annotation** instead:
+
+```bash
+kubectl annotate application <app> -n argocd argocd.argoproj.io/refresh=hard --overwrite
+```
+(reconstructed command; the runbook states the technique, not the exact line.)
+
+**Observability stack:** Google Managed Prometheus for metrics, Grafana for dashboards, OpenTelemetry Collector to Cloud Trace for traces, four Cloud Monitoring alert policies (evidence 19, 19B).
+
+**SLOs (ADR-015):**
+
+| SLI | Alert threshold |
+|---|---|
+| API availability | success rate below 99.5% |
+| API latency | p95 above 100 ms |
+| Scheduling latency | p95 above 50 ms |
+| Job success rate | below 99% |
+
+Two alerts fired during burst testing and recovered by themselves. Baselines came from roughly **21 jobs**, so treat them as a small low-volume sample: API latency ≈ 5 ms flat; scheduling p50/p95/p99 ≈ 7.5 / 9.75 / 9.95 ms.
+
+**The measurement-integrity story (VERIFIED):** the baseline job success rate first read about **13%**. Inspecting job records in Redis directly showed that several manual test commands had submitted a bare string as the payload, and the worker had crashed on each. The worker was fixed and the baseline retaken on clean data. *A measurement that makes the SLO look bad is not discarded because it is inconvenient, and one that makes it look good is not trusted because it is convenient.*
+
+**Grafana gotchas (VERIFIED):**
+- Grafana has **no PVC**. A pod reschedule wiped its service-account token and datasource **twice**; both were recovered by hand.
+- `datasource-syncer` flag names are plural: `--datasource-uids` and `--grafana-api-token`, **not** `grafana-datasource-uid`. A bad flag makes the binary print its own accurate help text.
+- A counter can be correct at a pod's `/metrics` for minutes while Google Managed Prometheus still reads zero. That is **backend ingestion lag, not a bug**.
+
+### Phases 10–11: KEDA autoscaling, canary delivery
+
+**KEDA (VERIFIED, evidence 16):**
+
+| Attempt | Signal | Outcome |
+|---|---|---|
+| 1 | Redis queue length | **Never moved**: the scheduler drains the pending queue in milliseconds |
+| 2 (current) | Scheduler **requeue rate** | Directly means "no worker had room", so it tracks real shortage |
+
+Workers scale **2 to 10**. A fixed-versus-autoscaled **cost comparison has not been run**.
+
+**Canary (ADR-019):** Argo Rollouts, steps 10 / 25 / 50 / 100, with `progressDeadlineSeconds: 120` and abort on failure.
+
+**Bad-deployment test (INCIDENT-006, VERIFIED):** a broken readiness check was shipped. The rollout aborted by itself and traffic stayed on the stable version. **125 seconds** from injection to Degraded (one timed run).
+
+The test took **three attempts**:
+
+| Attempt problem | Cause | Fix |
+|---|---|---|
+| CLI command failed | The Argo Rollouts `kubectl` plugin was not installed | Don't depend on the plugin |
+| `kubectl set image` had no effect | It does not work against custom resources | `kubectl patch` works |
+| Patch reverted instantly | Argo CD `selfHeal` undoes direct patches | **Pause auto-sync** for the duration of such a test |
+
+**Install-order traps (VERIFIED):**
+- Third-party CRDs over the **annotation size limit** fail under plain `kubectl apply` *while the controller still looks healthy*. Use `--server-side`.
+- The **Rollouts CRDs must exist before** the Helm release that creates a `Rollout`.
+- The Rollouts install manifest has **no namespace of its own**. Without `-n argo-rollouts` the controller landed in `default` and **never reconciled anything**.
+
+```bash
+kubectl create namespace argo-rollouts
+kubectl apply -n argo-rollouts --server-side --force-conflicts -f <argo-rollouts-install.yaml>
+kubectl get crd rollouts.argoproj.io        # must exist before the Helm release
+```
+(reconstructed form of the fix; `startup.sh` was changed accordingly. **That change is not yet proven by a full fresh run.**)
+
+### Phase 12: security hardening
+
+| Control | Defends against |
+|---|---|
+| Namespace-scoped **RBAC** | A compromised workload using the API server beyond its needs |
+| **Workload Identity** | Static cloud keys in pods |
+| **Workload Identity Federation** | Static keys in CI |
+| **NetworkPolicy default-deny + explicit allows** | Lateral movement between pods |
+| **Kyverno**, three policies enforced at admission: resource requests/limits; no `:latest`; no privileged containers | Unbounded resource use, unreproducible images, container escape paths |
+| CI scans: SAST, dependency, IaC, image | Known-vulnerable code, packages and images (but see strictness table in 7.2) |
+| Written **threat model** | Unspoken assumptions |
+
+**Admission control was tested for real (evidence 10):** a pod without resource limits was rejected at the API server.
+
+**NetworkPolicy trap (VERIFIED, Experiment 003):** policies are **additive**. An existing allow rule cancelled a new deny, which made one early Redis test invalid.
+
+**KNOWN LIMITATION:** `startup.sh` does not install Kyverno or KEDA, so a rebuilt cluster only has those policies if applied again by hand.
+
+### Phases 14–15: chaos experiments, incident consolidation
+
+See section 11.
+
+### Phases 16–17: load testing, FinOps
+
+- Load test write-up: `docs/reliability/load-test-phase16.md`.
+- FinOps: see section 15.
+
+### Phase 18: documentation
+
+README rewritten as a technical case study; 23 evidence screenshots committed; ADR and INCIDENT **numbering collisions found and fixed**.
+
+> **Two numbering schemes exist and both restart at 001:** Atlas ADRs in `docs/decisions/` (ADR-001 to ADR-019) and incidents in `docs/incidents/`; Atlas Operator ADRs in `docs/adr/` (ADR-001 to ADR-003) with its own `docs/incidents/incident-log.md` (INCIDENT-001 to INCIDENT-010). When you cite one, name which set.
+
+---
+
+## 7. The delivery pipeline
+
+### 7.1 Flow
+
+```
+commit (GitHub or GitLab)
+  |
+  v
+GitLab CI: test, lint, sast, dependency-scan, iac-scan,
+           build x3, image-scan, push, gitops-update
+  |
+  v
+helm/atlas-platform/values.yaml image tag bumped, synced to GitHub
+  |
+  v
+Argo CD (automated, selfHeal)  -->  Argo Rollouts canary 10 / 25 / 50 / 100
+```
+
+Pipeline variables (from the file):
+
+```yaml
+variables:
+  REGISTRY: us-central1-docker.pkg.dev/velrite-tf-test/atlas-images
+  IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"            # immutable, per commit
+  WIF_PROVIDER: "projects/<project-number>/locations/global/workloadIdentityPools/gitlab-pool/providers/gitlab-provider"
+  CI_SA_EMAIL: "atlas-gitlab-ci@velrite-tf-test.iam.gserviceaccount.com"
+```
+
+Stages, in order: `test`, `lint`, `sast`, `dependency-scan`, `build`, `image-scan`, `push`, `gitops-update`. (`iac-scan` also runs in the `dependency-scan` stage.)
+
+### 7.2 What each stage really enforces (honest table)
+
+This is the part most READMEs hide. Read the `allow_failure` and `exit-code` settings, not the stage names.
+
+| Stage | Tool | Blocks the pipeline? | Notes |
+|---|---|---|---|
+| `test` | placeholder `echo` | **No real test** | KNOWN LIMITATION: no unit tests for `workloads/`; validation was Docker Compose integration testing (ADR-005, ADR-006). Tracked as debt. |
+| `lint` | flake8 | **No** (`--exit-zero`) | Findings visible, non-blocking |
+| `sast` | Bandit | **Yes at medium+** (`bandit -ll`; the JSON report step is `|| true`) | Report saved as an artifact |
+| `dependency-scan` | Trivy `fs`, HIGH/CRITICAL, 4 requirements files | **No** (`allow_failure: true`) | Runs with `--exit-code 1` but the job is allowed to fail |
+| `iac-scan` | Checkov on `terraform/` and `helm/` | **No** (`|| true`, allowed to fail) | "Findings reviewed manually" |
+| `build-*` | `docker build` in DinD, tagged with commit SHA | Yes | Three images: api, scheduler, worker |
+| `image-scan` | Trivy on image tarballs | **No** (`--exit-code 0`, allowed to fail) | Non-blocking until baseline is triaged |
+| `push` | Docker push to Artifact Registry using a WIF token | Yes | Keyless |
+| `gitops-update` | clone, bump tag, push GitLab, sync GitHub | Yes | `[ci skip]` commit message prevents a loop |
+
+So the accurate statement is: **SAST blocks; the other scans report.** Do not describe the scanning as a hard security gate.
+
+### 7.3 The keyless push (real excerpt)
+
+```yaml
+push:
+  stage: push
+  image: docker:24-cli
+  services: [docker:24-dind]
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: "https://iam.googleapis.com/${WIF_PROVIDER}"
+  script:
+    - echo "${GITLAB_OIDC_TOKEN}" > /tmp/gitlab_oidc_token.txt
+    - gcloud iam workload-identity-pools create-cred-config "${WIF_PROVIDER}"
+        --service-account="${CI_SA_EMAIL}"
+        --output-file=/tmp/gcp-cred-config.json
+        --credential-source-file=/tmp/gitlab_oidc_token.txt
+    - gcloud auth login --cred-file=/tmp/gcp-cred-config.json
+    # ... access token -> docker login -> docker push x3
+```
+
+**Why this design:** an org policy forbids service-account keys, so CI exchanges a short-lived GitLab OIDC token for GCP access. There is nothing to leak or rotate.
+
+### 7.4 CI capacity problem and the self-hosted runner (ADR-002 Operator, VERIFIED)
+
+| Step | Problem | Fix |
+|---|---|---|
+| 1 | GitLab shared-runner **compute minutes ran out** | Run CI on a **self-hosted runner** on GCE VM `atlas-ci-runner` (runner `atlas-gce-runner`) |
+| 2 | Why not in the cluster? The builds need **privileged Docker-in-Docker**, which the cluster's Kyverno policy (correctly) refuses | Put the runner **outside the cluster on purpose**; do not weaken the policy |
+| 3 | Jobs were ignored by the runner | The runner carried a **tag**, so it skipped untagged jobs | Enable **`run_untagged`** on the runner |
+| 4 | Jobs still went to the exhausted shared pool | GitLab kept routing to shared runners | **Disable shared runners** for the project **through the API** |
+
+> **Stale-comment warning:** the header of `.gitlab-ci.yml` still says "Runs on GitLab.com shared runners", and a comment above the push stage still describes keyless auth as a "known limitation". Both are out of date (CI now runs on the self-hosted runner; WIF is implemented). Fix the comments so the file does not contradict the README.
+
+### 7.5 Check
+
+```bash
+# GitLab: pipeline passed (evidence 06), runner online (evidence in root: 08-self-hosted-runner-online.png)
+# Artifact Registry shows a new image tagged with the commit SHA (evidence 07)
+git log -1 --format=%s helm/atlas-platform/values.yaml    # "GitOps update image tag [ci skip]"
+```
+
+---
+
+## 8. Dual-remote sync and the race that broke it
+
+GitHub is the portfolio-authoritative copy; GitLab runs CI. The pipeline's last job writes the new image tag to GitLab, then syncs to GitHub.
+
+**Problem (INCIDENT-005, VERIFIED):** the sync did a blind `git push`. GitHub can move independently (manual pushes, other tooling), so the push **lost races** and **every `gitops-update` job failed during Phase 11**.
+
+**Fix:** fetch and rebase onto GitHub's real tip immediately before pushing, retry once if GitHub moved again. The real script:
+
+```sh
+#!/bin/sh
+set -e
+git remote remove github 2>/dev/null || true
+git remote add github "https://x-access-token:${GITHUB_PUSH_TOKEN}@github.com/velrite/atlas.git"
+
+attempt_sync() {
+  git fetch github main
+  git rebase github/main main
+  git push github main
+}
+
+if ! attempt_sync; then
+  echo "First sync attempt failed (github moved during rebase/push) -- retrying once."
+  git rebase --abort 2>/dev/null || true
+  sleep 5
+  attempt_sync
+fi
+```
+
+**KNOWN LIMITATION (technical debt):** the race is reduced, not eliminated. A second layer (a merge lock or restricting manual pushes during an active pipeline) was not built. Occasional merge-conflict pipeline failures remain possible.
+
+**Underrated detail:** the sync token is a **deliberate static secret**. It is scoped to this repo (ADR-011). It is the only one in the project.
+
+---
+
+## 9. Startup, teardown and full recovery
+
+```bash
+bash scripts/teardown.sh     # PLAN ONLY. Review, then run the printed terraform command yourself.
+bash scripts/startup.sh      # rebuilds everything, with a plan-then-confirm gate before terraform apply
+```
+
+### What `startup.sh` does, in order (FROM REPO runbook)
+
+| # | Step | Why it exists |
+|---|---|---|
+| 1 | Confirm gcloud project context, pull the latest repo | Avoid acting on the wrong project |
+| 2 | `terraform init` + plan, **reject the plan if any resource shows project = `yes`** | A past unconfirmed interactive prompt produced exactly that |
+| 3 | Require typing `apply` | Nothing destructive ever runs unattended |
+| 4 | Fetch kubectl credentials, **hard-check the context matches the expected cluster**, abort on mismatch | Other clusters exist in the account |
+| 5 | Apply RBAC, **recreate `atlas-workload-ksa`** with its Workload Identity annotation | Not in Terraform or Helm; without it pods cannot be created |
+| 6 | Helm install or upgrade of the platform | The workload |
+| 7 | **Check Artifact Registry is empty** (true after any teardown). If so, trigger a pipeline rebuild via an empty commit and **exit early** | Destroying the registry wipes images, but `values.yaml` still pins a dead tag |
+| 8 | Install Argo CD (core mode), apply the default **AppProject**, apply the Application | Core mode does not create the AppProject |
+| 9 | Install Grafana from the pinned manifest, recreate its service-account token and a placeholder datasource through its own HTTP API, bind Workload Identity, deploy the datasource-sync CronJob, trigger one run, reimport the dashboard JSON with the datasource UID rewritten | None of Grafana's state survives a namespace deletion |
+| 10 | Install the OTel Collector with its own service account and Workload Identity binding | Traces to Cloud Trace |
+
+If `startup.sh` exits early after triggering an image rebuild, **wait for the GitLab pipeline to go green through `gitops-update`, then re-run `startup.sh`.**
+
+### Known unverified fixes in `startup.sh`
+
+- **KNOWN LIMITATION:** the CRD-ordering fix has been merged and syntax-checked but **no full fresh run has exercised it**.
+- **KNOWN LIMITATION (found by reading, not running):** step 5 waits on `deployment/atlas-api`, but `atlas-api` is an Argo **Rollout**, not a Deployment. This would likely stop a fresh run. **Not yet fixed.**
+- `startup.sh` does **not** install Kyverno or KEDA.
+
+### Rebuild gotchas that really happened
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Pods in `ImagePullBackOff` after rebuild | Registry is empty; `values.yaml` points at a deleted image; there was also a **duplicate `tag:` key** | Rebuild images, correct the tag, delete the duplicate key |
+| Pods fail with "error looking up service account" | `atlas-workload-ksa` not recreated | Recreate it (step 5) |
+| `terraform` silently planned against `yes` | Interactive prompt, no tfvars | Always pass `project_id` explicitly |
+
+---
+
+## 10. Health check: run after every startup
+
+`terraform apply` succeeding or `helm install` saying `deployed` means an API accepted a request, **not** that anything is healthy.
+
+```bash
+echo "== context ==";  kubectl config current-context
+echo "== nodes ==";    kubectl get nodes
+echo "== NOT running (should be empty) ==";
+kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded
+echo "== CRDs ==";     kubectl get crd rollouts.argoproj.io
+echo "== argocd app ==";  kubectl get applications -n argocd
+echo "== rollout ==";  kubectl get rollout -A
+echo "== policies ==";  kubectl get clusterpolicy 2>/dev/null || echo "Kyverno not installed"
+echo "== scaledobject =="; kubectl get scaledobject -A 2>/dev/null || echo "KEDA not installed"
+```
+(reconstructed; adjust namespaces to your chart values.)
+
+**Healthy means:** context is `atlas-dev`; nodes Ready; no non-running pods; CRD present; Argo app Synced/Healthy; Rollout healthy; and, if you expect them, Kyverno and KEDA present.
+
+### The real proof of recovery (FROM REPO runbook)
+
+Pods running is not proof. Prove the system *works*:
+
+1. Submit one real job through the API and confirm it **completes**.
+2. Confirm the Grafana dashboard shows **real, nonzero data** by querying a metric through the datasource proxy.
+3. Confirm a real trace in Cloud Trace containing the span names **`submit_job`, `schedule_job`, `execute_job`** for that job. This is the actual end-to-end proof.
+
+---
+
+## 11. Chaos experiments and measured results
+
+Each experiment follows the same discipline: **hypothesis first, blast radius stated, then measure, then record the outcome.** Files are in `chaos/`.
+
+| # | Scenario | Result | Evidence |
+|---|---|---|---|
+| 001 | One of two API pods deleted | Detected in ~**2 s**, restored in **12 s** | `chaos/experiment-001-pod-failure-atlas-api.md`, screenshot 15 |
+| 002 | Node cordoned and drained | **132 s**; PodDisruptionBudgets respected | `chaos/experiment-002-node-drain.md`, screenshot 13 |
+| 003 | Redis held at zero pods | **66 s** confirmed down; **silent job loss exposed** | `chaos/experiment-003-redis-dependency-down.md`, screenshot 14 |
+| — | Bad deployment to automatic abort | **125 s** (one timed run) | INCIDENT-006, ADR-019 |
+| — | GitOps drift correction | **under 3 s** | `docs/reliability/gitops-drift-reconciliation-evidence.md` |
+| — | Regional failover | **Not measured** (Phase 13 deferred) | ADR-001, ADR-018 |
+
+### Experiment 003: three attempts, two invalid (kept in the record)
+
+| Attempt | What went wrong | Lesson |
+|---|---|---|
+| 1 | It measured **Argo CD self-healing the scale-to-zero in about a second**, not a Redis outage | Pause auto-sync before a dependency-down test |
+| 2 | A **NetworkPolicy deny was cancelled by an existing allow rule**, because policies are additive | A deny only works if nothing else allows the traffic |
+| 3 (valid) | Redis held at 0 pods for **66 s**, with sync paused and pods confirmed at 0 | Exposed that in-flight jobs are **silently discarded**, even though the API had already returned 202 |
+
+**Why this finding matters:** worse than "briefly unreachable". A client was told 202 Accepted and the job then vanished with no error anywhere. Next fix: persistent volume with AOF.
+
+### Node pool upgrade stall (INCIDENT-003, VERIFIED)
+
+A machine-type change stalled for **1 to 2 hours** because single-replica Deployments sat behind PodDisruptionBudgets that allowed **zero** disruptions. Fixed by running **two replicas**, confirmed by the clean drain in experiment 002 (evidence 12, 13).
+
+---
+
+## 12. Incident register
+
+Atlas incident files are `INCIDENT-001` to `INCIDENT-006` in `docs/incidents/`.
+
+| ID | Symptom | Root cause | Fix | Lesson |
+|---|---|---|---|---|
+| 001 | A worker received more jobs than it had room for | Capacity reported via periodic heartbeat; scheduler used stale data | Atomic `HINCRBY` reservation at assignment time, retested | Reserve at the moment of decision, not from a stale view |
+| 002 | Image pulls failed; third node would not start | Node pool SA lacked `artifactregistry.reader`; regional SSD quota | Grant the role; address quota | The node pool identity pulls images |
+| 003 | Node pool machine-type change stalled 1–2 h | Single replicas behind PDBs allowing zero disruption | Run two replicas | Drain-safety needs replicas ≥ 2 |
+| 004 | OTel Flask instrumentation failed on import | `setuptools` 82 removed `pkg_resources`; unbounded fix resolved to 84.0.0 | Pin `setuptools` < 82 | A version bound needs both an upper and a lower limit |
+| 005 | Every `gitops-update` job failed in Phase 11 | Blind `git push` lost races against manual pushes | Fetch + rebase + retry-once | Never blind-push to a shared remote |
+| 006 | Rollback test needed three attempts | CLI plugin missing; `set image` unsupported on CRs; `selfHeal` reverted the patch | `kubectl patch`; pause auto-sync | Know what your GitOps controller will undo |
+
+Additional recorded failures without a numbered file in the sources I could see:
+
+| Failure | Cause | Fix |
+|---|---|---|
+| Job success rate read 13% | Bare-string payloads crashing the worker | Payload validation; baseline retaken |
+| KEDA never scaled | Queue length drained in milliseconds | Switch to requeue rate |
+| ADR/INCIDENT numbers collided | Two scheme sets | Renumbered in Phase 18 |
+
+---
+
+## 13. Teardown
+
+```bash
+bash scripts/teardown.sh          # plan only; read it
+# then run the terraform destroy command it prints, yourself, with project_id passed explicitly
+```
+
+Check afterwards (screenshot 15-loadbalancer-teardown in the repo root shows the load-balancer teardown):
+
+```bash
+gcloud container clusters list --project velrite-tf-test        # atlas-dev gone (Forge/Project7 may remain: not yours to delete here)
+gcloud compute forwarding-rules list --project velrite-tf-test  # no leftover load-balancer rules
+gcloud compute instances list --project velrite-tf-test         # the CI VM atlas-ci-runner is separate
+```
+(reconstructed checks.)
+
+**Do not destroy** the Terraform state bucket. **Do not touch** the Forge or Project7 clusters that share the project.
+
+---
+
+## 14. Atlas Operator and Operations API
+
+A Flutter **Android** app for checking on Atlas from a phone (`operator/`), with a small FastAPI backend (`operations-api/`) in the cluster serving only `/health` and `/ready`.
+
+| Layer | Choice |
+|---|---|
+| App | Flutter, Android only |
+| State | Riverpod |
+| Local storage | Hive (capped cache) |
+| Backend | FastAPI: `/health`, `/ready` only |
+
+**Three modes**, shown on an app-bar badge that cycles on tap:
+
+| Mode | Data source |
+|---|---|
+| OFFLINE | Fixtures |
+| INTEGRATION | A real call to the Operations API |
+| LIVE | Not connected to anything real yet |
+
+**VERIFIED on a real device (2026-09-20):** in INTEGRATION mode the connection banner went Healthy → Failed (backend scaled to 0) → Healthy (restored to 1). Recorded as Operator INCIDENT-009. `flutter analyze` clean; 24 tests pass.
+
+### Operator problems and fixes
+
+| Problem | Cause | Fix |
+|---|---|---|
+| `SocketException … errno = 1` on the phone | Main Android manifest had **no `INTERNET` permission**. Debug and profile manifests do, so a debug build never shows it (INCIDENT-010) | Add the permission to the main manifest |
+| Badge could not enter INTEGRATION mode | No tap handler | Add it |
+| A test fake failed | Skipped `MockPlatformInterfaceMixin` | Add the mixin |
+| A cache write failure turned a good read into an error | Error handling coupled them | Make cache write best-effort |
+| `pumpAndSettle()` hung | A loading spinner never settles | Pump explicit durations |
+| First Android build ran out of disk | Cloud Shell home is **4.8 GB** | Move the SDK to `/opt` |
+| Diagnostics could show fixture numbers under a LIVE badge | `OfflineDiagnosticRepository` ignores the environment | **FIXTURE DATA label** shown whenever the badge is not OFFLINE (mitigated 2026-09-20; full fix awaits real diagnostics endpoint) |
+
+### Temporary public exposure (Operator ADR-003)
+
+To test on a real phone, a temporary **LoadBalancer** put the zero-auth endpoints on the internet for about **34 minutes**. Automated scanners probed for PHP/ThinkPHP/Docker paths; every probe got a **404**. Only the **end** of the log was read, so this is **not a full audit**. The Service was deleted immediately afterward and the temporary cleartext-HTTP flag was removed.
+
+**Operator limitations:** every screen except the connection banner is fixture data; no auth in the app or API; the Operations API image is **built and pushed by hand, not by CI**; the app can display Atlas but never run `terraform apply` or `destroy` (Operator ADR-001).
+
+Go-live runbook: `docs/runbooks/atlas-operator-go-live.md`.
+
+---
+
+## 15. Cost engineering
+
+| Item | Cost / note |
+|---|---|
+| 2× `e2-standard-4` | **$0.2680/hr = $195.67/month** (Cloud Billing Catalog API, list prices) |
+| CI VM `atlas-ci-runner` | **NOT PROVIDED** (not in the figure above) |
+| Disks, egress, load balancers, Artifact Registry storage | **NOT PROVIDED** |
+| Observability (GMP, Cloud Trace) | **NOT PROVIDED** |
+
+**Attribution:** list prices applied to resource requests measured by **OpenCost**. OpenCost's own **pricing downloader failed with a known upstream permission bug**, so its cost totals are **not used**.
+
+**Not done:** a fixed-versus-autoscaled cost comparison.
+
+**What makes it expensive:** leaving the cluster up. **Cost control:** destroy between sessions (about $0.27/hr while up).
+
+---
+
+## 16. Technology decisions and tool defense
+
+> Rows marked *reason in ADR* mean the choice is recorded in the named ADR, whose text was not available to me. Read it before defending the choice in an interview.
+
+| Tool | Role | Why used (known) | Realistic alternative | Production assessment |
+|---|---|---|---|---|
+| Terraform + GCS state | Infrastructure as code | Reproducible; state in a bucket (ADR-002) | Pulumi, Config Connector | Appropriate for production |
+| SA impersonation | Terraform identity | Org policy forbids keys | Keys (blocked) | Appropriate for production |
+| Workload Identity Federation | CI identity | Keyless, scoped to project and branch (ADR-008) | Stored SA key (blocked) | Appropriate for production |
+| Zonal GKE Standard | Orchestration | Lower cost and complexity than regional (ADR-001/018 defer multi-region) | Regional, Autopilot | Appropriate with conditions: single-zone failure domain |
+| Flask | API | Small, simple | FastAPI | Appropriate mainly for this project |
+| Redis (single, no PVC) | Queue and job state | Simple, fast; accepted SPOF (ADR-005) | Pub/Sub, Postgres, Redis + AOF/HA | **Not recommended for production as configured** (measured job loss) |
+| Argo CD (core mode) | GitOps | Declarative, self-heal | Flux | Appropriate for production |
+| Argo Rollouts | Canary + auto-abort | Measured 125 s rollback (ADR-019) | Flagger, plain Deployment | Appropriate for production |
+| KEDA | Autoscaling on requeue rate | Scale on a custom metric | HPA on CPU | Appropriate with conditions |
+| Kyverno | Admission policy | Kubernetes-native YAML policies | OPA Gatekeeper | Appropriate for production |
+| GitLab CI | Pipeline | Existing project; WIF supported | GitHub Actions | Appropriate with conditions: scans mostly non-blocking |
+| Self-hosted runner (GCE) | CI compute | Shared minutes exhausted; DinD refused in cluster | Kaniko, shared runners | Appropriate with conditions: single VM |
+| Google Managed Prometheus | Metrics | Managed, native to GKE | Self-managed Prometheus | Appropriate for production |
+| Grafana (no PVC) | Dashboards | Familiar UI | Cloud Monitoring dashboards | **Not recommended as configured** (state lost twice) |
+| OpenTelemetry → Cloud Trace | Tracing (ADR-014) | One trace across four processes | Jaeger, Tempo | Appropriate for production |
+| OpenCost | Cost attribution | Namespace-level breakdown | Billing export + labels | Appropriate with conditions: pricing downloader bug |
+| Flutter + Riverpod + Hive | Operator app | Cross-platform UI, testable state | Native Kotlin, Bloc | Appropriate for this project |
+| FastAPI | Operations API | Minimal, typed | Flask, Go | Appropriate with conditions: no auth |
+
+---
+
+## 17. Architecture decision records (index)
+
+| ADR | Decision | What I can state |
+|---|---|---|
+| ADR-001 | Multi-region topology | Designed, **not built** |
+| ADR-002 | Terraform state and identity | GCS state; impersonation; no keys |
+| ADR-005 | Workload platform design | Redis single instance, no persistence, accepted SPOF |
+| ADR-008 | GitLab → GCP WIF | Keyless CI |
+| ADR-011 | GitHub/GitLab sync | One deliberate scoped GitHub token |
+| ADR-014 | OpenTelemetry tracing | Trace context carried inside the job record |
+| ADR-015 | SLO definitions | Targets in 6, Phases 7–9 |
+| ADR-018 | Phase 13 deferred (follow-up) | Multi-region not claimed |
+| ADR-019 | Argo Rollouts canary progressDeadlineAbort | 125 s measured abort |
+| Operator ADR-001 | Operator foundation | App can display Atlas, never run `terraform apply`/`destroy` |
+| Operator ADR-002 | Self-hosted CI runner | GCE VM, outside cluster |
+| Operator ADR-003 | Temporary LoadBalancer for device test | ~34 min exposure, then removed |
+
+The other Atlas ADRs (003, 004, 006, 007, 009, 010, 012, 013, 016, 017) exist in `docs/decisions/`; their text was not available when this was written. **Do not paraphrase them from memory.**
+
+---
+
+## 18. Security assessment
+
+### What is enforced
+
+Namespace-scoped RBAC, Workload Identity, WIF, NetworkPolicy default-deny with explicit allows, three Kyverno admission policies, SAST that blocks at medium+, and a written threat model (`docs/security/threat-model.md`).
+
+### Gaps, stated plainly
+
+| Gap | Impact |
+|---|---|
+| **Atlas API has no authentication**, only NetworkPolicy | Anyone with network reach can submit jobs |
+| **Redis has no auth** | Anyone with network reach to Redis can read or alter queues |
+| **Secret Manager not used** | Secrets management is minimal |
+| **Operations API has no auth/TLS** | Fine for a dev backend only; worsened briefly by the temporary LB |
+| Dependency, IaC and image scans are **non-blocking** | Known-vulnerable packages can still ship |
+| Kyverno and KEDA not installed by `startup.sh` | Rebuilt cluster silently loses policies |
+| Image signing, SBOM, cluster-side signature verification | **NOT PROVIDED** (not evidenced) |
+
+---
+
+## 19. Failure modes and reliability
+
+| Failure | Detection | Behaviour | Recovery | User impact |
+|---|---|---|---|---|
+| API pod dies | ~2 s | Other replica serves | Replaced in 12 s | None (2 replicas) |
+| Node drain | Immediate | PDBs respected | 132 s | None expected |
+| Bad release | Rollout readiness fails | Canary aborts, traffic stays on stable | 125 s to Degraded, automatic | None |
+| Manual change outside Git | Argo CD diff | `selfHeal` reverts | Under 3 s | None |
+| **Redis pod replaced** | Not alerted on | **All in-flight jobs lost** | Manual resubmission | **Silent data loss after 202** |
+| Malformed payload | Worker error | Now fails fast, no retry burn | n/a | Clear error |
+| Worker capacity exhausted | Requeue rate rises | KEDA scales workers up to 10 | Automatic | Added latency |
+| Grafana pod rescheduled | Dashboards empty | State wiped | **Manual** reconfiguration | Observability gap |
+| CI VM down | Pipeline stalls | No builds | Manual | Delivery stops |
+| Zone outage | n/a | Cluster unavailable | **Unhandled** (zonal) | Full outage |
+| Registry emptied by teardown | `ImagePullBackOff` | Pods can't start | `startup.sh` triggers rebuild | Delay |
+| GitHub moves during sync | Job failure | Retry once | Mostly automatic | Occasional failed pipeline |
+
+**Automatically recovered:** pod loss, node drain, bad release, drift, capacity pressure.
+**Manually recovered:** Grafana state, CI VM, registry rebuild order.
+**Currently unhandled:** zone loss, Redis durability, any regional failure.
+
+---
+
+## 20. Testing
+
+| Kind | Status |
+|---|---|
+| Unit tests (`workloads/`) | **None.** The CI `test` stage is a placeholder. Tracked as technical debt. |
+| Integration | Docker Compose integration during Phases 4–5 (manual) |
+| Chaos | Experiments 001–003 |
+| Rollback | INCIDENT-006 (one timed run, 125 s) |
+| Load | `docs/reliability/load-test-phase16.md` |
+| Admission control | A real denial of a no-limits pod |
+| Operator | 24 Flutter tests passing; real-device transition test |
+| Security scans | Bandit blocks; the rest report |
+
+---
+
+## 21. Performance and scalability
+
+- **Measured:** a small low-volume sample (~21 jobs) for latency baselines. Not a throughput benchmark.
+- **Likely ceiling:** the scheduler is a **single-threaded loop**; Redis is a single instance.
+- **Worker capacity** is self-reported, not measured from cgroups.
+- **Scaling:** workers scale 2–10 via KEDA on requeue rate. The API and scheduler scaling behaviour is **NOT PROVIDED**.
+- **What happens at the limit:** requeue rate climbs, workers scale to 10, then jobs wait.
+
+---
+
+## 22. Technical debt register
+
+| Debt | Type | Risk | Recommended change |
+|---|---|---|---|
+| Redis has no PVC | Known limitation | Silent job loss on pod replacement | PVC with AOF, or a managed queue |
+| Grafana has no PVC | Known limitation | Manual recovery (happened twice) | PVC, or provision dashboards from code |
+| Atlas API zero auth | Intentional simplification | No access control beyond NetworkPolicy | Real auth before wider exposure |
+| `operations-api` no auth/TLS | Intentional | Same | Auth + TLS, or keep dev-only |
+| `startup.sh` CRD-ordering fix unverified | Temporary | Could still fail on a fresh run | Run one full fresh `startup.sh` end to end |
+| `startup.sh` waits on `deployment/atlas-api` | Bug found by reading | Fresh run likely stops | Wait on the Rollout instead |
+| `startup.sh` omits Kyverno and KEDA | Gap | Rebuilt cluster lacks policies and autoscaling | Install them in the script |
+| `gitops-update` race with manual pushes | Known | Occasional pipeline failure | A lock around `main` pushes |
+| Non-blocking scans | Intentional for the phase | Vulnerabilities can ship | Triage baseline, then make blocking |
+| Placeholder `test` stage | Actual debt | No unit coverage | Real unit tests |
+| Stale CI comments | Documentation drift | README contradicts the file | Update the comments |
+| Operator image built by hand | Actual debt | Not reproducible | Add to CI |
+| Operator LIVE data | Not built | Screens are fixtures | Build endpoints (Operator phase 10+) |
+
+### Gap analysis: current to production
+
+| Area | Current | Production requirement | Change | Justified? |
+|---|---|---|---|---|
+| Availability | Zonal cluster | Survive a zone loss | Regional cluster | Only if the availability target needs it |
+| State durability | Ephemeral Redis | Jobs survive restarts | PVC + AOF, or managed store | **Yes**, if jobs are non-reproducible |
+| Authentication | None on API/Redis | AuthN/Z | API auth, Redis AUTH/TLS | **Yes** before any exposure |
+| Secrets | Minimal | Managed secrets | Secret Manager | Yes |
+| Supply chain | Reporting scans, no signing | Gated scans, signed images | Make scans blocking; add signing and admission verification | Yes |
+| CI | One VM runner | Resilient runners | Ephemeral/autoscaled runners | Conditional |
+| Project isolation | Shared with Forge and Project7 | Dedicated project | Separate project | Yes |
+| Multi-region | Deferred | Only if required | Revisit ADR-001 | Not justified now |
+
+Some current choices are fine for what Atlas is: default-deny networking, keyless identity and canary rollback would all be kept in production.
+
+---
+
+## 23. Documentation drift to fix before you share this publicly
+
+These contradictions exist in the repo right now:
+
+1. `.gitlab-ci.yml` header: "Runs on GitLab.com shared runners" — outdated; CI is on the self-hosted runner.
+2. `.gitlab-ci.yml` push-stage comment calls keyless auth a "known limitation" — outdated; WIF is implemented.
+3. The repo root holds loose evidence images (`01-cluster-nodes.png`, `02-…` and others) that duplicate or conflict with `docs/evidence/`. Move or delete them; numbering differs between the two places.
+4. Two helper scripts live at the root with a path-like name (`scripts-sync-github.sh`, `scripts-update-tag.sh`) while a `scripts/` folder exists. The pipeline copies them by those names; if you move them, update `gitops-update`.
+5. The README says Operator device-test evidence is "not captured yet", while the Operator verification is recorded as done on 2026-09-20. Make them agree once screenshots are added.
+
+---
+
+## 24. Troubleshooting index
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Terraform plan shows project = `yes` | Interactive prompt accepted a stray value | Pass `project_id` explicitly |
+| Pods `ImagePullBackOff` right after rebuild | Registry empty, `values.yaml` pins a deleted tag (and a duplicate `tag:` key) | Rebuild images; fix tag |
+| Pods fail to create, "service account" error | `atlas-workload-ksa` missing | Recreate with Workload Identity annotation |
+| First-deploy pulls fail | Node pool SA lacks `artifactregistry.reader` | Grant it |
+| Third node won't start | Regional SSD quota | Raise quota |
+| Rollouts never reconcile | Controller installed in `default` (no namespace in manifest) | Install with `-n argo-rollouts` |
+| `kubectl apply` of a CRD fails with annotation too long | 262 KB annotation limit | `--server-side` |
+| `Rollout` creation fails | CRDs not installed yet | Install CRDs before the Helm release |
+| `argocd app sync` errors "configmap not found" | Core mode has no server | Hard-refresh annotation; or wait for auto-sync |
+| Patch to a live Rollout reverts | Argo CD `selfHeal` | Pause auto-sync for the test, or change Git |
+| `kubectl set image` does nothing on a Rollout | Doesn't work on custom resources | `kubectl patch` |
+| Every `gitops-update` job fails | Blind push lost a race with GitHub | Fetch + rebase + retry (current script) |
+| CI job never starts on the self-hosted runner | Runner tagged, job untagged | Enable `run_untagged` |
+| CI jobs go to the exhausted shared pool | Shared runners still enabled | Disable shared runners via the API |
+| DinD job refused in-cluster | Kyverno blocks privileged containers | Run the runner outside the cluster |
+| OTel Flask import error `pkg_resources` | `setuptools` ≥ 82 | Pin below 82 |
+| Worker retries burn out immediately | Bare-string payload | Payload validation |
+| Job success rate looks like 13% | Test commands sent bad payloads | Inspect Redis job records; retake baseline |
+| KEDA never scales | Queue length drains in ms | Use scheduler requeue rate |
+| Over-assigned worker | Stale heartbeat capacity | Atomic reservation |
+| Redis test measured nothing | Argo CD self-healed the scale-down | Pause sync first |
+| NetworkPolicy deny has no effect | Policies are additive; an allow exists | Remove or narrow the allow |
+| Node pool change stalls for hours | PDB allows zero disruption on single replicas | Two replicas |
+| Grafana dashboards empty after a reschedule | No PVC; token and datasource wiped | Recreate via `startup.sh` step 9; long term, PVC or provisioning as code |
+| Metric correct on pod, zero in Managed Prometheus | Ingestion lag | Wait; not a bug |
+| `datasource-syncer` flag error | Real flags are plural: `--datasource-uids`, `--grafana-api-token` | Read the binary's help |
+| OpenCost totals unusable | Pricing downloader upstream permission bug | Use list prices from the Billing Catalog API |
+| Android app: `SocketException … errno = 1` | Missing `INTERNET` in main manifest | Add it |
+| Android build: disk full | Cloud Shell home is 4.8 GB | Move SDK to `/opt` |
+| Widget test hangs | `pumpAndSettle()` on a spinner | Pump fixed durations |
+| Wrong cluster modified | Multiple clusters in one account | Verify `current-context` every time |
+| Cloud Shell dropped mid-apply | Normal | Reconnect, check real state, don't blindly rerun |
+
+---
+
+## 25. Known gaps: do not claim these
+
+- **No multi-region behaviour** of any kind.
+- **No unit tests** for the workload services.
+- **Scans other than SAST do not block** the pipeline.
+- **No authentication** on the Atlas API, Operations API or Redis.
+- **Redis loses job state** on pod replacement.
+- **Fixed versus autoscaled cost** comparison not run.
+- **`startup.sh`** has not been run end to end since its latest fixes, and has a likely stop at step 5.
+- **Operator LIVE mode** is not connected; most screens are fixtures.
+- **Billing state** on the project was "not enabled" when last checked.
+- **Throughput limits** are unmeasured; baselines come from ~21 jobs.
+- **Signed images, SBOM, admission-time signature checks:** not evidenced.
+
+---
+
+## 26. Interview defense
+
+**What does it do?** A distributed job-execution platform on GKE, built to measure behaviour under failure.
+
+**Why did you build it this way?** To study failure with evidence: every claim has an experiment, incident or ADR behind it.
+
+**Why is the scheduler capacity-aware, and what was the bug?** Workers reported capacity by heartbeat, so the scheduler decided on stale numbers and over-assigned. I now reserve capacity atomically with Redis `HINCRBY` at assignment, and re-ran the original scenario to confirm.
+
+**Why did your first autoscaling signal fail?** Queue length never moved because the scheduler drains it in milliseconds. The requeue rate directly means "no worker had room".
+
+**How do you handle a bad release?** Argo Rollouts canary 10/25/50/100 with `progressDeadlineSeconds: 120`. A broken readiness check aborted automatically in 125 s while traffic stayed on the stable version. It's one timed run, so I don't claim a distribution.
+
+**How are secrets handled?** An org policy forbids service-account keys, so none exist. Terraform impersonates; CI uses Workload Identity Federation; pods use Workload Identity. The one static secret is a scoped GitHub token for syncing, documented in ADR-011.
+
+**What happens if Redis dies?** In-flight jobs are lost, even ones already acknowledged with 202. I found this by experiment 003 and documented it. The next fix is a PVC with AOF, or a managed queue.
+
+**Why a self-hosted CI runner?** Shared minutes ran out, and the builds need privileged Docker-in-Docker, which my Kyverno policy correctly blocks. I moved CI outside the cluster instead of weakening the policy.
+
+**What did you choose not to build?** Multi-region (ADR-001, deferred by ADR-018), authentication, and unit tests. Each is listed as a known limitation.
+
+**Were your scans a security gate?** Only SAST blocks. The dependency, IaC and image scans report but don't block, because baseline findings weren't triaged yet.
+
+**What would you change with twice the budget?** Durable Redis, authentication, blocking scans with image signing, a dedicated project, and a real fresh-run test of `startup.sh`.
+
+**What would you remove if cost became critical?** Keep the cluster torn down between sessions (already done); drop OpenCost; consider a single node for non-chaos work.
+
+**What did chaos testing teach you that review wouldn't?** The Redis loss. Reading the manifests shows "no volume". Only running it shows that the API had already told the client "accepted".
+
+---
+
+## 27. Engineering summary
+
+**What I built:** a distributed workload platform on GKE with Terraform, keyless identity, GitOps, canary delivery with automatic rollback, KEDA autoscaling, managed observability with SLO alerts, admission policy, chaos experiments, and an Android operations app.
+
+**Core engineering problem:** staying correct and recoverable while capacity and infrastructure state keep changing.
+
+**Major decisions:** zonal GKE over regional; keyless identity everywhere; Redis as an accepted single point of failure to be measured; scheduler requeue rate as the scaling signal; CI outside the cluster; multi-region designed but deferred.
+
+**Major trade-offs:** speed and simplicity over durability and authentication; non-blocking scans over a gate nobody had triaged.
+
+**Important lessons:** measure before claiming; keep invalid experiments in the record; know what your GitOps controller will undo; a deny policy is not a deny if an allow exists; never trust "pods running" as proof of recovery.
+
+**Current limitations:** section 25.
+
+**Skills demonstrated (only what is evidenced):** GKE and Terraform; GCP IAM, Workload Identity and Workload Identity Federation; GitLab CI with a self-hosted runner; Argo CD and Argo Rollouts; KEDA; Kyverno and NetworkPolicy; Google Managed Prometheus, OpenTelemetry and Cloud Trace; chaos engineering with hypotheses and measured outcomes; FinOps with live pricing; incident and ADR documentation; Flutter, Riverpod and Hive with real-device verification.
+
+---
+
+## Repository layout
+
+```
+terraform/        modules and environments (GCS backend, impersonation)
+helm/             atlas-platform chart
+gitops/           Argo CD Application and AppProject
+workloads/        api, scheduler, worker, shared job model
+scheduler/        scheduler source
+operations-api/   FastAPI backend for the Operator app
+operator/         Flutter Android app
+observability/    dashboards and alert policies
+policies/         Kyverno policies
+security/         security configuration
+chaos/            experiments with hypothesis, blast radius, outcome
+scripts/          startup.sh, teardown.sh, generate-docs.sh
+tests/            automated tests
+docs/             decisions, adr, incidents, reliability, runbooks, security, finops, evidence
+.gitlab-ci.yml    pipeline definition
+```
+
+`scripts/generate-docs.sh` regenerates the Operator docs from built-in text and refuses to run without `--force-overwrite`, because it would revert later hand edits.
+
+## Documentation map
+
+- Chaos experiments: `chaos/`
+- Failure matrix: `docs/reliability/failure-matrix.md`
+- Load test: `docs/reliability/load-test-phase16.md`
+- GitOps drift evidence: `docs/reliability/gitops-drift-reconciliation-evidence.md`
+- Threat model: `docs/security/threat-model.md`; Operator security controls: `docs/security/security-controls.md`
+- Cost attribution: `docs/finops/cost-attribution.md`
+- Technical debt: `docs/engineering/technical-debt.md`; maturity: `docs/engineering/engineering-maturity.md`
+- Runbooks: `docs/runbooks/full-recovery.md`, `session-startup-shutdown.md`, `atlas-operator-go-live.md`
+- Operator overview: `docs/architecture/system-overview.md`
+- Retrospective: `docs/RETROSPECTIVE.md`
+- Evidence index: `docs/evidence/README.md`
+
+
+
+
+
+# ---------------------------------------------------
 # Enterprise Cloud Platform: Full Rebuild Guide
 
 Rebuild every phase from an empty AWS account and an empty GitHub
