@@ -238,6 +238,1639 @@ Two early commits (`f82e4b5` and `ac72be4`) have messages that say more than the
 
 "I did an industrial attachment at Center4Tech from May to September 2023. I started with no hands-on building experience. A supervising engineer trained me, and eight weeks later I was lead instructor for their summer camp, teaching 13 students. I also built and repaired prototypes, like a robotic arm damaged in transport, a traffic signal model and a laser alarm."
 # --------------------------------------------------
+# Production Platform Engineering Handbook
+
+**EKS → Autoscaling → Terraform + ArgoCD → CI/CD + GitOps → Cost → Reliability & Portfolio**
+
+> A condensed but complete study README. Every module keeps: the **mental model**, the **key code/commands**, the **failure modes**, and the **checklist**. Repeated storytelling and filler were removed; the concepts were not.
+>
+> ⚠️ **Honesty note:** every dollar amount, latency, MTTR and benchmark below is an **illustrative example** from the lessons, not a measured result. When you reuse this in a portfolio or CV, replace them with numbers from your own labs and label each claim **verified** (you ran it, you have evidence), **configured** (written, not tested), or **planned**.
+
+---
+
+## Table of Contents
+
+| # | Module | What you learn |
+|---|---|---|
+| **A** | [Production EKS](#a-production-eks) | Private VPC + cluster, IRSA, ALB Ingress, cert-manager, Prometheus/Grafana, hardening, app deploy |
+| **B** | [Autoscaling](#b-autoscaling--full-stack) | HPA math, Cluster Autoscaler, Spot, NTH, spike simulation, balloon pods, Karpenter |
+| **C** | [Infrastructure as Code](#c-infrastructure-as-code--terraform--argocd) | Terraform, modules, state, break-and-recover, ArgoCD, Kustomize |
+| **D** | [CI/CD + GitOps](#d-cicd--gitops) | Pipeline stages, security gates, OPA, drift, sync waves, rollbacks |
+| **E** | [Cost Domination](#e-cost-domination) | Audit, Spot, Graviton, rightsizing, NAT/endpoints, S3, commitments |
+| **F** | [Reliability & Portfolio](#f-reliability-observability--portfolio) | SLOs, chaos, postmortems, benchmarks, portfolio repo |
+| **G** | [How everything connects](#g-how-everything-connects--master-checklist) | Dependency map + master checklist |
+
+**The one-sentence version of the whole stack:**
+Terraform builds the AWS foundation and the cluster → ArgoCD (inside the cluster) deploys everything from Git → CI builds, scans and signs the images → HPA + Cluster Autoscaler + Spot scale it → Prometheus/Grafana/SLOs watch it → chaos tests prove it → cost work makes it cheap. **Git is the only door; nobody clicks the console.**
+
+---
+
+# A. Production EKS
+
+> Build it the way companies run it: **private cluster, zero public nodes, workload identity via IRSA, automatic TLS, full observability, policy enforcement.**
+
+## A.0 Master mental model
+
+```
+                         INTERNET
+                            │ HTTPS 443 only
+                            ▼
+                    Route 53 (DNS → ALB)
+                            ▼
+                  AWS ALB (public) ◄── created by AWS Load Balancer Controller
+                            │            from Ingress objects
+                            ▼ HTTP, inside VPC only
+┌───────────────────────── PRIVATE VPC ─────────────────────────┐
+│  EKS CONTROL PLANE (AWS-managed: API server, etcd, scheduler) │
+│        │ private API endpoint only                             │
+│  PRIVATE NODE GROUPS                                           │
+│    system-nodes (tainted: ingress, cert-manager, monitoring)   │
+│    app-nodes    (your workloads)                               │
+│        │                                                       │
+│  NAT Gateway per AZ (outbound only)  +  VPC endpoints          │
+└────────────────────────────────────────────────────────────────┘
+```
+
+| Piece | Why it exists |
+|---|---|
+| **Private cluster** | No public IPs on nodes, API server not on the internet; only the ALB is public. |
+| **IRSA** | Pods get AWS permissions with **no access keys**: short-lived STS creds, least privilege per pod, CloudTrail shows which pod did what. |
+| **cert-manager** | Automatic certificates + renewal (no 3 a.m. "cert expired" pages). |
+| **Prometheus + Grafana + Alertmanager** | Scrape every 15 s → dashboards → alerts. "You can't fix what you can't see." |
+| **Kyverno / NetworkPolicy / PSS / RBAC** | Policy-as-code and zero trust inside the cluster. |
+
+> ⚠️ Because the API endpoint is private, `kubectl` must run from **inside the VPC** (bastion/SSM, VPN, or a CI runner in the VPC). Plan that before you create the cluster.
+
+## A.1 Toolchain
+
+| Tool | Job |
+|---|---|
+| `aws` CLI v2 | AWS APIs (`aws sts get-caller-identity` to verify) |
+| `eksctl` | Creates cluster + CloudFormation + IAM + kubeconfig in one command |
+| `kubectl`, `helm` | Kubernetes CLI, package manager |
+| `k9s`, `kubectx/kubens`, `stern`, `jq` | Fast navigation, context switching, multi-pod logs, JSON |
+
+```bash
+aws --version && eksctl version && kubectl version --client && helm version --short && jq --version
+```
+
+## A.2 VPC foundation (network before cluster)
+
+```bash
+export AWS_REGION="us-east-1"; export CLUSTER_NAME="prod-eks"
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export VPC_CIDR="10.0.0.0/16"
+
+VPC_ID=$(aws ec2 create-vpc --cidr-block $VPC_CIDR --query 'Vpc.VpcId' --output text)
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
+aws ec2 create-tags --resources $VPC_ID --tags Key=Name,Value=${CLUSTER_NAME}-vpc \
+  Key=kubernetes.io/cluster/${CLUSTER_NAME},Value=shared
+```
+
+**Subnets — the tags are critical** (the ALB controller finds subnets by them):
+
+| Subnet | CIDR | Tags |
+|---|---|---|
+| public-1a / 1b | 10.0.1.0/24, 10.0.2.0/24 | `kubernetes.io/role/elb=1`, `kubernetes.io/cluster/<name>=shared` |
+| private-1a / 1b | 10.0.3.0/24, 10.0.4.0/24 | `kubernetes.io/role/internal-elb=1`, `kubernetes.io/cluster/<name>=owned` |
+
+```bash
+# helper: create a tagged subnet → prints id
+mk_subnet() { aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block $1 --availability-zone ${AWS_REGION}$2 \
+  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${CLUSTER_NAME}-$3},$4]" \
+  --query 'Subnet.SubnetId' --output text; }
+
+PUB_1A=$(mk_subnet 10.0.1.0/24 a public-1a "{Key=kubernetes.io/role/elb,Value=1},{Key=kubernetes.io/cluster/${CLUSTER_NAME},Value=shared}")
+PUB_1B=$(mk_subnet 10.0.2.0/24 b public-1b "{Key=kubernetes.io/role/elb,Value=1},{Key=kubernetes.io/cluster/${CLUSTER_NAME},Value=shared}")
+PRIV_1A=$(mk_subnet 10.0.3.0/24 a private-1a "{Key=kubernetes.io/role/internal-elb,Value=1},{Key=kubernetes.io/cluster/${CLUSTER_NAME},Value=owned}")
+PRIV_1B=$(mk_subnet 10.0.4.0/24 b private-1b "{Key=kubernetes.io/role/internal-elb,Value=1},{Key=kubernetes.io/cluster/${CLUSTER_NAME},Value=owned}")
+aws ec2 modify-subnet-attribute --subnet-id $PUB_1A --map-public-ip-on-launch
+aws ec2 modify-subnet-attribute --subnet-id $PUB_1B --map-public-ip-on-launch
+```
+
+**Gateways and routing — NAT per AZ for real HA, AZ-local routes:**
+
+```bash
+IGW_ID=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+
+EIP_1A=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
+EIP_1B=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
+NAT_1A=$(aws ec2 create-nat-gateway --subnet-id $PUB_1A --allocation-id $EIP_1A --query NatGateway.NatGatewayId --output text)
+NAT_1B=$(aws ec2 create-nat-gateway --subnet-id $PUB_1B --allocation-id $EIP_1B --query NatGateway.NatGatewayId --output text)
+aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT_1A $NAT_1B
+
+# public RT → IGW ; private-1a RT → NAT_1A ; private-1b RT → NAT_1B
+PUB_RT=$(aws ec2 create-route-table --vpc-id $VPC_ID --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id $PUB_RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+for S in $PUB_1A $PUB_1B; do aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $S; done
+
+PRIV_RT_1A=$(aws ec2 create-route-table --vpc-id $VPC_ID --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id $PRIV_RT_1A --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT_1A
+aws ec2 associate-route-table --route-table-id $PRIV_RT_1A --subnet-id $PRIV_1A
+PRIV_RT_1B=$(aws ec2 create-route-table --vpc-id $VPC_ID --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id $PRIV_RT_1B --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT_1B
+aws ec2 associate-route-table --route-table-id $PRIV_RT_1B --subnet-id $PRIV_1B
+```
+
+**VPC endpoints** (keep AWS API traffic off the NAT): S3 **gateway** endpoint is free — always add. **Interface** endpoints (~$7/mo each): `ec2, ecr.api, ecr.dkr, sts, logs, ssm, ssmmessages, ec2messages, autoscaling` — private DNS on, security group allowing 443 from the VPC CIDR.
+
+```bash
+aws ec2 create-vpc-endpoint --vpc-id $VPC_ID --vpc-endpoint-type Gateway \
+  --service-name com.amazonaws.${AWS_REGION}.s3 --route-table-ids $PRIV_RT_1A $PRIV_RT_1B
+
+EP_SG=$(aws ec2 create-security-group --group-name ${CLUSTER_NAME}-vpce-sg --description vpce --vpc-id $VPC_ID --query GroupId --output text)
+aws ec2 authorize-security-group-ingress --group-id $EP_SG --protocol tcp --port 443 --cidr $VPC_CIDR
+for SVC in ec2 ecr.api ecr.dkr sts logs ssm ssmmessages ec2messages autoscaling; do
+  aws ec2 create-vpc-endpoint --vpc-id $VPC_ID --vpc-endpoint-type Interface \
+    --service-name com.amazonaws.${AWS_REGION}.${SVC} --subnet-ids $PRIV_1A $PRIV_1B \
+    --security-group-ids $EP_SG --private-dns-enabled
+done
+```
+
+## A.3 The EKS cluster (`eksctl`)
+
+Key design decisions in the config: private API only, OIDC on (for IRSA), control-plane logs on, managed add-ons, **two node groups** — a tainted **system** group for infrastructure and an **app** group for workloads.
+
+```yaml
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata: { name: prod-eks, region: us-east-1, version: "1.29",
+            tags: { Project: production, ManagedBy: eksctl, Environment: production } }
+
+privateCluster: { enabled: true, additionalEndpointServices: ["autoscaling", "cloudformation"] }
+vpc:
+  id: "<VPC_ID>"
+  subnets:
+    private: { us-east-1a: {id: "<PRIV_1A>"}, us-east-1b: {id: "<PRIV_1B>"} }
+  clusterEndpoints: { privateAccess: true, publicAccess: false }   # NO public API server
+
+iam: { withOIDC: true }                       # required for IRSA
+cloudWatch: { clusterLogging: { enable: [api, audit, authenticator, controllerManager, scheduler],
+                                logRetentionInDays: 30 } }
+addons:
+- { name: vpc-cni }
+- { name: coredns }
+- { name: kube-proxy }
+- { name: aws-ebs-csi-driver, wellKnownPolicies: { ebsCSIController: true } }
+
+managedNodeGroups:
+- name: system-nodes                           # ingress controller, cert-manager, monitoring
+  instanceType: t3.medium
+  minSize: 2
+  maxSize: 4
+  desiredCapacity: 2
+  privateNetworking: true
+  labels: { node-role: system, workload-type: infrastructure }
+  taints: [{ key: workload-type, value: infrastructure, effect: NoSchedule }]
+  iam: { withAddonPolicies: { cloudWatch: true, autoScaler: true, ebs: true } }
+- name: app-nodes                              # your workloads
+  instanceType: t3.medium
+  minSize: 2
+  maxSize: 10
+  desiredCapacity: 3
+  privateNetworking: true
+  labels: { node-role: application, workload-type: application }
+  iam: { withAddonPolicies: { cloudWatch: true, autoScaler: true, ebs: true } }
+```
+
+```bash
+eksctl create cluster -f cluster.yaml      # ~15–20 min: control plane, 2 ASGs, IAM roles, SGs, kubeconfig
+kubectl get nodes -L node-role,workload-type
+OIDC_ID=$(aws eks describe-cluster --name $CLUSTER_NAME --query 'cluster.identity.oidc.issuer' --output text | cut -d/ -f5)
+```
+
+## A.4 IRSA — identity without secrets
+
+**Without IRSA:** IAM user → access key → stored as a k8s Secret → static credential that lives forever; leak = permanent access; rotation is manual.
+**With IRSA:** IAM *role* + ServiceAccount linked by an annotation. No keys.
+
+```
+1. EKS has an OIDC provider (identity provider)
+2. kubelet injects a signed JWT into the pod (/var/run/secrets/eks.amazonaws.com/serviceaccount/token)
+3. AWS SDK finds it automatically and calls STS AssumeRoleWithWebIdentity:
+   "I'm ServiceAccount api-sa in namespace production of cluster prod-eks"
+4. STS verifies the JWT signature against the OIDC provider's public key
+5. STS checks the role's TRUST POLICY allows exactly that ServiceAccount
+6. Returns temporary credentials → SDK uses them and refreshes automatically
+Result: no static keys · short-lived creds · per-pod least privilege · per-pod audit trail
+```
+
+```bash
+kubectl create namespace production; kubectl create namespace monitoring
+kubectl label namespace monitoring monitoring=enabled
+
+OIDC_PROVIDER="oidc.eks.${AWS_REGION}.amazonaws.com/id/${OIDC_ID}"
+cat > /tmp/trust.json << EOF
+{ "Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_PROVIDER}" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": { "StringEquals": {
+      "${OIDC_PROVIDER}:aud": "sts.amazonaws.com",
+      "${OIDC_PROVIDER}:sub": "system:serviceaccount:production:api-sa" } } }] }
+EOF
+APP_ROLE_ARN=$(aws iam create-role --role-name ${CLUSTER_NAME}-api-role \
+  --assume-role-policy-document file:///tmp/trust.json --query Role.Arn --output text)
+# attach a least-privilege permission policy (S3 read on one bucket, one Secrets Manager path, CW logs):
+aws iam put-role-policy --role-name ${CLUSTER_NAME}-api-role --policy-name api-permissions \
+  --policy-document file:///tmp/app-permission-policy.json
+```
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-sa
+  namespace: production
+  annotations:
+    eks.amazonaws.com/role-arn: "<APP_ROLE_ARN>"     # ← the link between k8s and IAM
+```
+
+**Test it:** run a pod with `serviceAccountName: api-sa` and image `amazon/aws-cli` → `aws sts get-caller-identity` should show `assumed-role/prod-eks-api-role/...`. Inside app pods you'll see `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` env vars.
+**Shortcut:** `eksctl create iamserviceaccount --cluster … --namespace … --name … --attach-policy-arn … --approve` creates role + trust + SA in one command.
+
+## A.5 AWS Load Balancer Controller + Ingress
+
+Without it, each `Service type=LoadBalancer` makes its own NLB (10 services ≈ 10 LBs ≈ $160+/mo, no path routing). With it, **one Ingress → one ALB** with host/path rules and TLS for hundreds of services.
+
+```bash
+# The controller policy is NOT an AWS-managed policy — download the official JSON and create it:
+curl -o alb-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+ALB_POLICY=$(aws iam create-policy --policy-name AWSLoadBalancerControllerIAMPolicy \
+  --policy-document file://alb-policy.json --query Policy.Arn --output text)
+eksctl create iamserviceaccount --cluster $CLUSTER_NAME --namespace kube-system \
+  --name aws-load-balancer-controller --attach-policy-arn $ALB_POLICY --approve
+
+helm repo add eks https://aws.github.io/eks-charts && helm repo update
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller -n kube-system \
+  --set clusterName=$CLUSTER_NAME --set region=$AWS_REGION --set vpcId=$VPC_ID \
+  --set serviceAccount.create=false --set serviceAccount.name=aws-load-balancer-controller \
+  --set tolerations[0].key=workload-type --set tolerations[0].value=infrastructure \
+  --set tolerations[0].effect=NoSchedule --set nodeSelector.workload-type=infrastructure
+```
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: test-ingress
+  namespace: production
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip            # route straight to pod IPs
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+spec:
+  ingressClassName: alb
+  rules:
+  - http: { paths: [{ path: /, pathType: Prefix,
+           backend: { service: { name: echo-server-svc, port: { number: 80 } } } }] }
+```
+`kubectl get ingress -n production -w` → the ADDRESS is the ALB DNS name (2–3 min).
+
+## A.6 cert-manager — automatic TLS
+
+| Challenge | How it proves domain ownership | Use when |
+|---|---|---|
+| **HTTP-01** | Serves a token at `/.well-known/acme-challenge/…` | DNS already points at your ingress |
+| **DNS-01** | Creates a TXT record `_acme-challenge.<domain>` via Route53 API | Wildcards, private clusters (needs Route53 IRSA) |
+
+```bash
+helm repo add jetstack https://charts.jetstack.io && helm repo update
+helm install cert-manager jetstack/cert-manager -n cert-manager --create-namespace \
+  --version v1.14.0 --set installCRDs=true      # + tolerations/nodeSelector for system nodes
+# IRSA for Route53 (GetChange, ChangeResourceRecordSets, ListResourceRecordSets, ListHostedZonesByName):
+eksctl create iamserviceaccount --cluster $CLUSTER_NAME --namespace cert-manager \
+  --name cert-manager --attach-policy-arn $CERT_MANAGER_POLICY --override-existing-serviceaccounts --approve
+```
+
+```yaml
+# ALWAYS test with STAGING first — Let's Encrypt production has rate limits
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: { name: letsencrypt-staging }
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory   # prod: https://acme-v02.api.letsencrypt.org/directory
+    email: you@company.com
+    privateKeySecretRef: { name: letsencrypt-staging-key }
+    solvers:
+    - dns01: { route53: { region: us-east-1, hostedZoneID: <ZONE_ID> } }
+      selector: { dnsZones: ["yourdomain.com"] }
+```
+
+**Debug chain when a cert won't issue:** `Certificate → CertificateRequest → Order → Challenge` — `kubectl describe` each, in that order.
+**Inspect the result:** `kubectl get secret <tls> -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -dates -subject`.
+
+> ⚠️ **Important distinction (an error in the source material):** an **AWS ALB terminates TLS with ACM certificates** (`alb.ingress.kubernetes.io/certificate-arn`); it does **not** read cert-manager's Kubernetes TLS Secrets. Use cert-manager when TLS is terminated *inside* the cluster (e.g. ingress-nginx, Istio/Envoy, internal mTLS). For ALB, request an ACM cert (DNS-validated in Route53).
+
+## A.7 Observability — Prometheus + Grafana + Alertmanager
+
+```
+App/Infra ──scraped every 15s──► Prometheus ──fires──► Alertmanager ──► Slack / PagerDuty
+                                      ▲                                       │
+                                  Grafana (PromQL dashboards) ◄───── you open it, see the problem
+kube-state-metrics = k8s object state (desired vs running)   node-exporter = per-node CPU/mem/disk/net
+```
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts && helm repo update
+helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --version 56.0.0 \
+  --set prometheus.prometheusSpec.retention=30d \
+  --set prometheus.prometheusSpec.replicas=2 \
+  --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=50Gi \
+  --set grafana.persistence.enabled=true --set grafana.persistence.size=10Gi
+  # + resources, tolerations, nodeSelector for system nodes · set grafana.adminPassword from a Secret, not a literal
+
+kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090   # /targets → all UP
+kubectl port-forward -n monitoring svc/kube-prometheus-stack-grafana 3000:80
+```
+
+**Alertmanager → Slack:** store the webhook in a Secret; an `AlertmanagerConfig` routes `severity=critical → #alerts-critical`, `warning → #alerts-warnings`, with `groupBy [alertname, cluster, namespace]`, `groupWait 30s`, `repeatInterval 12h`, `sendResolved: true`.
+
+**Alerts that matter** (`PrometheusRule`, label `release: kube-prometheus-stack` so Prometheus picks it up):
+
+| Alert | Expression idea | Sev |
+|---|---|---|
+| PodCrashLooping | `rate(kube_pod_container_status_restarts_total[15m]) > 0` for 5m | critical |
+| DeploymentReplicasMismatch | `kube_deployment_spec_replicas != kube_deployment_status_replicas_available` for 5m | warning |
+| NodeNotReady | `kube_node_status_condition{condition="Ready",status="true"} == 0` for 2m | critical |
+| NodeCPU/MemoryHigh | usage > 85% for 10m | warning |
+| NodeDiskHigh | filesystem used > 85% | critical |
+| ContainerCPUThrottling | `rate(container_cpu_cfs_throttled_seconds_total[5m]) / rate(container_cpu_cfs_periods_total[5m]) > 0.25` — *silent latency killer* | warning |
+| ContainerOOMKilled | `kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} > 0` | critical |
+| PersistentVolumeAlmostFull | `kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > 0.85` | warning |
+| APIServerLatencyHigh | p99 `apiserver_request_duration_seconds` (excl. WATCH/CONNECT) > 1s | warning |
+| PodsPending | `kube_pod_status_phase{phase="Pending"} > 0` for 10m | warning |
+
+**Handy PromQL:** `topk(10, sum by (pod,namespace)(rate(container_cpu_usage_seconds_total[5m])))` · memory vs limit: `sum by(pod)(container_memory_working_set_bytes) / sum by(pod)(kube_pod_container_resource_limits{resource="memory"})` · node memory free %: `node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100`.
+
+## A.8 Hardening — zero trust inside the cluster
+
+**NetworkPolicy:** start with **default-deny ingress + egress**, then add explicit allows (ingress from the LB/controller on the app port, DNS egress to kube-system, HTTPS egress with the **instance-metadata IP `169.254.169.254/32` excluded**, scrape ingress from namespaces labelled `monitoring=enabled`).
+> Tip: namespaces automatically carry `kubernetes.io/metadata.name=<ns>` — select on that instead of a hand-made `name:` label.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-all, namespace: production }
+spec: { podSelector: {}, policyTypes: [Ingress, Egress] }
+```
+
+**Pod Security Standards** (namespace labels): `pod-security.kubernetes.io/enforce=restricted` (+ `warn`, `audit`). Restricted = no privileged, no privilege escalation, no host namespaces, drop ALL capabilities, run as non-root, seccomp profile, (read-only root FS in practice).
+
+**RBAC:** developer = read-only (get/list/watch pods, logs, services, configmaps, deployments; **no `pods/exec`**) · SRE = modify workloads + exec, **no RBAC or Secrets** · CI = scoped service account · nobody gets cluster-admin day to day.
+
+**Kyverno (policy-as-code)** — three baseline `ClusterPolicy` rules for the production namespace:
+1. require CPU+memory **requests and limits** on every container
+2. **disallow `:latest`** image tags (`image: "!*:latest"`)
+3. require `app` and `version` labels on Deployments
+
+(Newer Kyverno versions use `validationFailureAction: Enforce` with a capital E; `Audit` first to see impact.)
+
+**Cluster Autoscaler** also installs here — full treatment in [Module B](#b-autoscaling--full-stack).
+
+## A.9 Deploy an application the production way
+
+```yaml
+# ResourceQuota + LimitRange first: cap the namespace and give sane defaults
+apiVersion: v1
+kind: ResourceQuota
+metadata: { name: production-quota, namespace: production }
+spec: { hard: { requests.cpu: "20", requests.memory: 40Gi, limits.cpu: "40", limits.memory: 80Gi, pods: "100" } }
+---
+apiVersion: v1
+kind: LimitRange
+metadata: { name: production-limitrange, namespace: production }
+spec:
+  limits:
+  - type: Container
+    default:        { cpu: 500m, memory: 256Mi }
+    defaultRequest: { cpu: 100m, memory: 128Mi }
+    max:            { cpu: "4",  memory: 8Gi }
+    min:            { cpu: 50m,  memory: 64Mi }
+```
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api, namespace: production, labels: { app: api, version: "1.0.0" } }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: api } }
+  strategy: { type: RollingUpdate, rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }   # zero-downtime
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+  revisionHistoryLimit: 5
+  template:
+    metadata:
+      labels: { app: api, version: "1.0.0" }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9090" }
+    spec:
+      serviceAccountName: api-sa                       # IRSA → AWS creds, no keys
+      terminationGracePeriodSeconds: 60
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 3000, fsGroup: 2000,
+                         seccompProfile: { type: RuntimeDefault } }
+      topologySpreadConstraints:                        # never all replicas in one AZ
+      - { maxSkew: 1, topologyKey: topology.kubernetes.io/zone,
+          whenUnsatisfiable: DoNotSchedule, labelSelector: { matchLabels: { app: api } } }
+      affinity:
+        podAntiAffinity:                                # prefer different nodes
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm: { topologyKey: kubernetes.io/hostname,
+                               labelSelector: { matchLabels: { app: api } } }
+      containers:
+      - name: api
+        image: nginxinc/nginx-unprivileged:1.24   # non-root can't bind :80 with plain nginx; this listens on 8080
+        ports: [{ name: http, containerPort: 8080 }, { name: metrics, containerPort: 9090 }]
+        resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { cpu: 500m, memory: 256Mi } }
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true,
+                           capabilities: { drop: ["ALL"] } }
+        startupProbe:   { httpGet: { path: /, port: http }, failureThreshold: 30, periodSeconds: 10 }
+        readinessProbe: { httpGet: { path: /, port: http }, periodSeconds: 5, failureThreshold: 3 }
+        livenessProbe:  { httpGet: { path: /, port: http }, initialDelaySeconds: 10, periodSeconds: 10 }
+        volumeMounts: [{ name: tmp, mountPath: /tmp }, { name: cache, mountPath: /var/cache/nginx },
+                       { name: run, mountPath: /var/run }]           # writable dirs for read-only root FS
+      volumes: [{ name: tmp, emptyDir: {} }, { name: cache, emptyDir: {} }, { name: run, emptyDir: {} }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: api-hpa, namespace: production }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: api }
+  minReplicas: 3
+  maxReplicas: 20
+  metrics: [{ type: Resource, resource: { name: cpu, target: { type: Utilization, averageUtilization: 60 } } }]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: api-pdb, namespace: production }
+spec: { minAvailable: 2, selector: { matchLabels: { app: api } } }    # drains/rollouts can't drop below 2
+```
+
+Verify: `kubectl get all,hpa,pdb -n production` · `kubectl get pods -o wide` (spread across AZs/nodes) · `kubectl exec <pod> -- env | grep AWS` (IRSA vars present).
+
+## A.10 Daily debugging toolkit
+
+```bash
+kubectl get nodes -o wide && kubectl top nodes
+kubectl get pods -A --field-selector 'status.phase!=Running' | grep -v Completed
+stern -n production api --tail=50                                  # multi-pod logs
+kubectl get certificates -A                                        # cert expiry / readiness
+kubectl describe ingress -n production <name>                      # ALB controller events
+kubectl logs -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller --tail=50
+kubectl logs -n cert-manager -l app.kubernetes.io/name=cert-manager --tail=50
+kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | sort -u   # all images
+```
+
+## A.11 Known pitfalls in the source material
+
+| Issue | Fix |
+|---|---|
+| `kubectl apply -n ns - << EOF` is missing `-f` | `kubectl apply -n ns -f - << EOF` |
+| `AWSLoadBalancerControllerIAMPolicy` isn't an AWS-managed policy | create it from the official `iam_policy.json` (shown above) |
+| ALB + cert-manager Secrets | ALB uses **ACM**; cert-manager is for in-cluster TLS |
+| Plain `nginx` as non-root on port 80 | use `nginx-unprivileged` (8080) or a different image |
+| `kubectl run --requests=…` | flag removed; use `--overrides` or a manifest |
+| Private API + running `kubectl` from a laptop | needs bastion/SSM/VPN/in-VPC runner |
+| Grafana admin password literal in `--set` | use a Secret / ExternalSecret |
+
+## A.12 Checklist
+
+**Infrastructure:** VPC across 2+ AZs (public + private) · NAT per AZ · VPC endpoints (S3, ECR, STS, SSM, logs) · private API endpoint · OIDC provider · system (tainted) + app node groups · Cluster Autoscaler on system nodes.
+**IRSA:** role per workload, least privilege · trust policy scoped to namespace + ServiceAccount · SA annotated · tested with `sts get-caller-identity` · **no IAM users / access keys in the cluster**.
+**Ingress + TLS:** ALB controller running · staging issuer tested first · certs auto-renewing · HTTPS redirect everywhere.
+**Observability:** all Prometheus targets UP · Grafana behind TLS + IP allow-list · Alertmanager → Slack/PagerDuty · custom alerts (crash, OOM, throttling, disk).
+**Security:** default-deny NetworkPolicy · PSS restricted · RBAC (dev read-only, SRE modify) · Kyverno (limits, no `:latest`, labels) · no privileged containers · CloudTrail + API audit logs.
+**Reliability:** requests + limits · liveness + readiness (+ startup) · HPA · PDB · topology spread · anti-affinity · `maxUnavailable: 0` · grace period ≥ 30 s.
+**Cost:** requests tuned · S3/DynamoDB endpoints · Spot for non-critical · Savings Plan for baseline · cost-allocation tags.
+
+**Labs:** build VPC by hand with correct tags · create private cluster · IRSA pod assumes role with no keys · Ingress creates a real ALB · staging then prod cert · Prometheus targets UP + rules loaded · Slack alert fires · Kyverno blocks a pod without limits · NetworkPolicy blocks cross-namespace call · load → HPA scales → scales down · drain a node and watch the PDB protect you · rolling update with zero downtime.
+
+---
+
+# B. Autoscaling — Full Stack
+
+> Make infrastructure **breathe**: expand on load, contract when it drops, no human involved. Three layers, each solving a different problem.
+
+## B.0 The three layers and how they chain
+
+| Layer | Problem it solves | Speed | Limit |
+|---|---|---|---|
+| **HPA** (Horizontal Pod Autoscaler) | "Nodes have room, I need more **pods**." | 15–30 s | Useless if nodes are full |
+| **Cluster Autoscaler (CA)** | "Pods are **Pending** because nodes are full. Add **nodes**." | 2–5 min | Slow, can't predict |
+| **Spot instances** | "Add nodes, but cheaper (70–90% off)." | — | AWS can reclaim with a 2-minute warning |
+
+```
+Traffic spike
+  → pod CPU rises → HPA adds pods → they land on existing nodes (seconds)
+  → nodes fill → new pods Pending → CA asks AWS ASG for nodes (On-Demand baseline + Spot burst)
+  → nodes join → Pending pods schedule → traffic served
+Traffic drops → HPA removes pods → nodes under-utilized → CA removes nodes
+```
+Break any link and scaling fails. **Debug link by link:** pods not scaling → HPA/metrics-server · pods Pending → CA/node capacity · nodes not added → CA logs / ASG limits.
+
+---
+
+## B.1 HPA internals
+
+**Mental model — a thermostat.** You set "keep CPU at 60%"; HPA reads current average, adds pods when too hot, removes when too cool, checks every 15 s.
+
+```
+desiredReplicas = ceil( currentReplicas × currentMetric / targetMetric )
+e.g. 3 pods at 91.7% CPU vs 60% target → ceil(3 × 1.528) = 5
+```
+Utilization % is measured against the pod's **request**, not its limit (and not absolute usage).
+
+**The loop (every 15 s):**
+1. **Fetch** metrics from metrics-server (kubelet → metrics-server aggregation, ~60 s refresh)
+2. **Calculate** desired replicas with the formula
+3. **Check constraints:** min/max replicas, stabilization window, scale policies
+4. **Apply:** patch `spec.replicas` on the Deployment → ReplicaSet creates pods → scheduler places them
+5. **Stabilization:** scale-up window short (0–60 s), scale-down long (180–600 s) — *scale up fast because users are hurting now; scale down slowly because load may come back in 2 minutes (prevents flapping).*
+
+**Three metric types (HPA v2):**
+
+| Type | Examples | Source |
+|---|---|---|
+| **Resource** | CPU (reliable), memory (sticky → can flap) | metrics-server |
+| **Custom (Pods/Object)** | `http_requests_per_second`, queue depth, active connections | Prometheus + prometheus-adapter |
+| **External** | SQS queue depth, Kafka lag, CloudWatch metrics | external metrics adapter (or KEDA) |
+
+**Production HPA:**
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: api-hpa, namespace: production }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: api }
+  minReplicas: 3          # minimum HA
+  maxReplicas: 50         # cost ceiling
+  metrics:
+  - { type: Resource, resource: { name: cpu,    target: { type: Utilization, averageUtilization: 60 } } }
+  - { type: Resource, resource: { name: memory, target: { type: Utilization, averageUtilization: 80 } } }
+  - type: Pods                                   # needs prometheus-adapter
+    pods: { metric: { name: http_requests_per_second }, target: { type: AverageValue, averageValue: "1000" } }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies: [ { type: Pods, value: 4, periodSeconds: 60 }, { type: Percent, value: 50, periodSeconds: 60 } ]
+      selectPolicy: Max                          # whichever adds MORE (aggressive up)
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies: [ { type: Pods, value: 1, periodSeconds: 60 }, { type: Percent, value: 10, periodSeconds: 60 } ]
+      selectPolicy: Min                          # whichever removes LESS (conservative down)
+```
+
+**What goes wrong:**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `<unknown>/60%` | metrics-server missing/broken | `kubectl top pods`; check `-l k8s-app=metrics-server` logs |
+| CPU 90% but replicas unchanged | in stabilization window · already at `maxReplicas` · **no resource requests** (can't compute %) | wait / raise max / **always set requests** |
+| Replicas change randomly | someone ran `kubectl scale` on an HPA-managed Deployment | never manually scale; HPA owns replicas (and tell ArgoCD `ignoreDifferences /spec/replicas`) |
+| Up–down–up flapping | scale-down window too short | `scaleDown.stabilizationWindowSeconds: 300` + `Min` policy |
+
+Diagnose: `kubectl describe hpa api-hpa -n production` → Conditions `AbleToScale / ScalingActive / ScalingLimited`, Events `SuccessfulRescale`.
+
+---
+
+## B.2 Cluster Autoscaler
+
+**Mental model — a building manager.** Floors = nodes, offices = pods. Pods waiting in the lobby (Pending) → manager calls the construction company (ASG) → new floor in 3–5 min. When floors sit nearly empty and everyone fits elsewhere, the manager removes a floor. **The catch:** the 3–5 minute build time means you need *buffer capacity* (see balloon pods).
+
+**Scale-up (loop every 10 s):**
+1. Any Pending pods?
+2. Pending **because of insufficient resources**? (not nodeSelector mismatch, missing toleration, image-pull error…)
+3. Simulate adding a node from each node group → would the pod fit?
+4. Yes → raise ASG desired count → wait for Ready
+
+Check the reason: `kubectl describe pod <p>` → `0/3 nodes available: Insufficient cpu` (CA helps) vs `didn't match nodeSelector` (CA does nothing — fix config).
+
+**Scale-down:** node < 50% **requested** utilization for ≥ 10 min (`--scale-down-utilization-threshold`, `--scale-down-unneeded-time`) → can all its pods fit elsewhere? → PDBs respected? → cordon → evict → terminate.
+
+**What blocks scale-down:** naked pods (no controller) · pods with local storage (emptyDir) · annotation `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` · a PDB that would be violated · non-evictable DaemonSet pods · node not unneeded long enough.
+
+**Install (IRSA + Helm):**
+
+```bash
+# least-privilege policy actions: autoscaling:Describe{AutoScalingGroups,AutoScalingInstances,LaunchConfigurations,Tags},
+# autoscaling:SetDesiredCapacity, autoscaling:TerminateInstanceInAutoScalingGroup,
+# ec2:DescribeLaunchTemplateVersions, ec2:DescribeInstanceTypes, eks:DescribeNodegroup
+eksctl create iamserviceaccount --cluster $CLUSTER_NAME --namespace kube-system \
+  --name cluster-autoscaler --attach-policy-arn $CA_POLICY --override-existing-serviceaccounts --approve
+
+helm repo add autoscaler https://kubernetes.github.io/autoscaler && helm repo update
+helm install cluster-autoscaler autoscaler/cluster-autoscaler -n kube-system \
+  --set autoDiscovery.clusterName=$CLUSTER_NAME --set awsRegion=$AWS_REGION \
+  --set rbac.serviceAccount.create=false --set rbac.serviceAccount.name=cluster-autoscaler \
+  --set extraArgs.balance-similar-node-groups=true \
+  --set extraArgs.skip-nodes-with-system-pods=false \
+  --set extraArgs.scale-down-delay-after-add=5m \
+  --set extraArgs.scale-down-unneeded-time=10m \
+  --set extraArgs.scale-down-utilization-threshold=0.5 \
+  --set extraArgs.scan-interval=10s \
+  --set extraArgs.expander=least-waste
+```
+Node groups must carry discovery tags `k8s.io/cluster-autoscaler/enabled=true` and `k8s.io/cluster-autoscaler/<cluster>=owned` (eksctl adds them). Watch: `kubectl logs -n kube-system -l app.kubernetes.io/name=cluster-autoscaler -f`.
+
+**Expanders (which node group to grow):** `random` (default; testing only) · **`least-waste`** (recommended: best-fitting instance, least leftover) · `least-nodes` (bin-pack) · `price` · **`priority`** (e.g. priority 10 = Spot, priority 1 = On-Demand fallback; configured via a ConfigMap).
+
+---
+
+## B.3 Spot instances — cheap capacity with teeth
+
+**Mental model — standby airline seats.** 70–90% cheaper, but AWS can take the seat back with a **2-minute warning**. Your app must stop taking traffic, finish in-flight work, and exit cleanly (`terminationGracePeriodSeconds` < 120 s).
+
+| ✅ Safe | ❌ Dangerous |
+|---|---|
+| stateless web/API pods · queue workers (work requeues) · batch with checkpoints · CI runners | databases · StatefulSets with node-local storage · control-plane components · single-replica services |
+
+**Strategy:** On-Demand **baseline** (system + minimum app capacity, never interrupted) + Spot **burst** (HPA-driven surge). If Spot is interrupted, pods reschedule; if no Spot is available, CA falls back to On-Demand.
+
+**Diversification is the #1 rule — pools matter more than price.** Don't request one instance type. Use 6–10 similar types (same vCPU/RAM) across 2+ AZs, with the `capacity-optimized` allocation strategy. More pools → fewer interruptions. Prefer common instance types in busy regions (big pools) over the cheapest-looking exotic ones.
+
+```yaml
+# add to the cluster (eksctl)
+managedNodeGroups:
+- name: spot-nodes
+  instanceTypes: [m5.large, m5a.large, m5n.large, m4.large, t3.large, t3a.large]
+  spot: true
+  minSize: 0
+  maxSize: 20
+  desiredCapacity: 0                  # CA scales from zero
+  privateNetworking: true
+  labels: { node-role: spot-worker, capacity-type: spot }
+  taints: [{ key: capacity-type, value: spot, effect: NoSchedule }]   # only tolerating pods land here
+  tags: { k8s.io/cluster-autoscaler/enabled: "true", k8s.io/cluster-autoscaler/prod-eks: owned }
+```
+
+**AWS Node Termination Handler (NTH)** — DaemonSet that watches for the interruption notice and drains gracefully:
+
+```bash
+helm install aws-node-termination-handler eks/aws-node-termination-handler -n kube-system \
+  --set enableSpotInterruptionDraining=true --set enableScheduledEventDraining=true \
+  --set enableRebalanceMonitoring=true --set enableRebalanceDraining=true \
+  --set nodeTerminationGracePeriod=120 --set podTerminationGracePeriod=60 --set emitKubernetesEvents=true
+```
+```
+T-2min  AWS posts interruption notice to instance metadata
+T-2min  NTH detects it (polls ~5s) → cordons node (no new pods) → evicts pods (SIGTERM)
+T-1min  pods finish in-flight requests
+T-0     instance terminates
+T+10s   CA sees lost capacity; displaced pods Pending → T+30s CA requests Spot from a different pool
+```
+(Test interruptions with AWS Fault Injection Service or NTH's IMDS mock — don't rely on ad-hoc CLI calls.)
+
+**A pod that tolerates Spot:**
+
+```yaml
+spec:
+  tolerations: [{ key: capacity-type, value: spot, effect: NoSchedule }]
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:      # prefer Spot, allow fallback
+      - weight: 100
+        preference: { matchExpressions: [{ key: capacity-type, operator: In, values: [spot] }] }
+  terminationGracePeriodSeconds: 90                          # < 120 s spot warning
+  containers:
+  - name: api
+    lifecycle: { preStop: { exec: { command: ["/bin/sh","-c","sleep 10"] } } }   # let the LB deregister first
+```
+
+---
+
+## B.4 The project — traffic spike simulation
+
+**Setup**
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl top nodes && kubectl top pods -A           # must work before HPA can
+# (kind/local only: add --kubelet-insecure-tls to metrics-server args)
+```
+Deploy a CPU-burning target (`registry.k8s.io/hpa-example`, requests 200m/limits 500m, 2 replicas, Service on :80) and an HPA: `min 2, max 20, cpu 50%, scaleUp window 0 (add 4 pods / 15 s), scaleDown window 60 s`.
+
+**Watch in separate terminals**
+```bash
+watch -n5 'kubectl get hpa load-target-hpa -n production'
+watch -n3 'kubectl get pods -n production -l app=load-target -o wide'
+watch -n10 'kubectl get nodes -L node-role,capacity-type'
+kubectl get events -n production -w --field-selector reason=SuccessfulRescale
+```
+
+**Attack**
+```bash
+kubectl run load-generator --image=busybox --restart=Never -n production \
+  -- /bin/sh -c "while true; do wget -q -O- http://load-target-svc.production.svc.cluster.local/; done"
+```
+
+**Multi-phase simulation script (the idea):** a script that logs `timestamp | nodes | ready pods | desired pods | CPU%` every 5 s through four phases —
+1. **Baseline** (30 s, no load)
+2. **Ramp-up** (start 3 generators, 20 s apart)
+3. **Full spike** (10 generators; record seconds until `readyReplicas > 2` = *scale-up latency*)
+4. **Stop load** (delete generators; record seconds until replicas ≤ 2 = *scale-down latency*)
+Write to a timestamped log file — that file *is* your evidence.
+
+**Cluster Autoscaler latency test:** deploy `ca-test` (20 replicas × 400m CPU, more than the nodes hold); poll every 10 s for `nodes / running / pending`; record: Pending detected → node added → all Running; then delete it and watch CA remove the idle node after the unneeded-time window.
+
+---
+
+## B.5 Scaling efficiency report (template — numbers are illustrative)
+
+| Measurement | Example result | Where the time goes |
+|---|---|---|
+| HPA spike → pods serving | ~45 s | metrics refresh 15 s + pod create 3 s + container start 12 s + readiness 15 s |
+| HPA load stops → baseline | ~2 min | 60 s stabilization window + gradual scale-down |
+| CA Pending → all Running | ~160 s | detect 10–40 s + EC2/Spot start ~45 s + kubelet register ~30 s + Ready ~15 s + schedule |
+| CA node scale-down | 10–15 min | by design (`unneeded-time`) |
+
+**Bottlenecks → fixes**
+1. metrics-server delay → lower `--metric-resolution`.
+2. Pod startup 12–15 s → smaller images, pre-pulled/cached images, tuned probes.
+3. Node provisioning 2–3 min (unavoidable) → **balloon pods**, Karpenter.
+4. Scale-down 10 min → tune `scale-down-unneeded-time` (cost vs stability).
+
+**Cost sanity check (illustrative):** m5.large On-Demand $0.096/h vs Spot ≈ $0.028/h. A mixed fleet of 2 On-Demand + burst Spot saves ~17% on a lightly bursty workload and 40–50% when most capacity is Spot.
+
+---
+
+## B.6 Optimizations (in priority order)
+
+**1. Balloon (overprovisioning) pods — eliminate the node-provision wait.**
+Low-priority placeholder pods reserve capacity. When real pods need space they **preempt** the balloons (instantly); the evicted balloons go Pending, which makes CA add a node *in the background*. Real pods never wait.
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: { name: balloon-priority }
+value: -10                         # lower than default (0) → always preempted first
+globalDefault: false
+description: "Placeholder pods that reserve buffer capacity"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: balloon, namespace: kube-system }
+spec:
+  replicas: 5
+  selector: { matchLabels: { app: balloon } }
+  template:
+    metadata: { labels: { app: balloon } }
+    spec:
+      priorityClassName: balloon-priority      # (the source forgot to define this class — it's required)
+      containers:
+      - { name: pause, image: registry.k8s.io/pause:3.9,
+          resources: { requests: { cpu: 500m, memory: 256Mi } } }
+```
+
+**2. Karpenter instead of Cluster Autoscaler.** CA: *you* define node groups and it picks between them. Karpenter: you define what pods need; it launches exactly the right instance directly (~30–60 s vs 2–3 min), handles Spot diversification and consolidation automatically. **Use it for new clusters; worth migrating for existing ones.**
+
+**3. Predictive/scheduled scaling (KEDA cron).** HPA *reacts*; cron triggers *anticipate* (pre-scale at 8:45 for a 9:00 spike).
+
+**4. Custom-metric HPA.** CPU is a proxy; requests/sec or queue depth is the real signal and moves before CPU does.
+
+---
+
+## B.7 Mental models
+
+1. **The scaling chain** — traffic → CPU → HPA → pods → nodes full → Pending → CA → nodes → scheduled. Debug each link.
+2. **Speed vs stability** — scale **up** fast (0–60 s window), scale **down** slow (180–600 s). The asymmetry is intentional.
+3. **Requests are the currency** — HPA %, scheduler placement and CA utilization all use **requests**, not usage. A pod using 900m with a 100m request shows 900% and scales hard; set requests near P50 of real usage (use VPA recommendations).
+4. **Spot is about pools, not prices** — big common pools + many instance types + `capacity-optimized`.
+5. **Karpenter is the direction of travel** — requirements-driven, faster, cheaper.
+
+## B.8 Checklist
+
+**Explain without notes:** the HPA formula · why scale-up window is short and scale-down long · what `<unknown>` means · requests vs limits for HPA · the CA scale-up loop · what blocks scale-down · why diversification beats price · the 2-minute notice · balloon pods · Karpenter vs CA.
+**Labs:** metrics-server + `kubectl top` · HPA on CPU 50% · one generator → scale-up observed · 10 generators → max scale · stop → scale-down observed · full spike script log · Spot node group + NTH · CA test (Pending → node → Running) · CA scale-down of idle nodes · all timestamps recorded.
+**Deliverable:** HPA up/down latency · CA provision/scale-down latency · Spot savings vs On-Demand · bottlenecks with fixes · balloon-pod recommendation · prioritized optimization list.
+
+---
+
+# C. Infrastructure as Code — Terraform + ArgoCD
+
+> No console clicks. Ever. Every resource is declared in code, code lives in Git, Git has history/blame/review → accountability → you can sleep.
+
+```
+BEFORE IaC: Bob clicks a VPC, Alice SSHes and installs nginx, Bob "tweaks" a security group.
+            Day 90 the server dies → nobody knows how it was configured. (Infra lives in someone's HEAD.)
+AFTER IaC:  Bob writes the VPC in Terraform → PR → Alice reviews → plan shows the diff → applied → logged forever.
+            Server dies → `terraform apply` → identical infrastructure in ~15 min. Zero memory required.
+```
+
+| | Handles | Examples |
+|---|---|---|
+| **Terraform** | AWS resources | VPC, subnets, EKS, RDS, IAM, Route53 |
+| **ArgoCD** | Kubernetes resources | Deployments, Services, Ingress, HPA, ConfigMaps |
+| **Relationship** | Terraform creates the **cluster** → ArgoCD runs **inside** it and deploys apps → Git is the source of truth for **both** (that's GitOps) |
+
+## C.1 Terraform fundamentals
+
+**Mental model — blueprint and building.** You write what the building *should* look like; Terraform reads what it looks like *now* (state), calculates the diff, makes **exactly** those changes.
+
+**The state file (`terraform.tfstate`) = Terraform's memory** — maps code names to real IDs (`aws_vpc.main → vpc-abc123`).
+- No state → Terraform tries to create everything again (duplicates, errors).
+- Lost state → it doesn't know what it owns. Corrupt state → it does wrong things.
+- Two simultaneous applies → disaster (hence **locking**).
+- State contains secrets → encrypted remote backend, never in Git.
+
+| Command | Purpose |
+|---|---|
+| `terraform init` | download providers, configure backend |
+| `terraform fmt -recursive` / `validate` | format / syntax check |
+| `terraform plan -out=tfplan` | **show** changes — read every line |
+| `terraform apply tfplan` | apply *exactly* the reviewed plan |
+| `terraform destroy` | nuclear option — approval + backups first |
+
+**Plan symbols:** `+` create (expected) · `~` update (verify intent) · `-` **destroy → STOP.** Destroy of `aws_vpc` wipes the cluster.
+
+**Building blocks** (learn each cold)
+
+```hcl
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers { aws = { source = "hashicorp/aws", version = "~> 5.0" } }   # ~> = >=5.0,<6.0
+  backend "s3" { bucket = "mycompany-terraform-state", key = "production/terraform.tfstate",
+                 region = "us-east-1", encrypt = true, dynamodb_table = "terraform-state-lock" }
+}
+provider "aws" { region = var.aws_region
+  default_tags { tags = { ManagedBy = "terraform", Environment = var.environment } } }
+
+variable "environment" {
+  type = string
+  validation { condition = contains(["production","staging","dev"], var.environment)
+               error_message = "Must be production, staging, or dev." }
+}
+locals { cluster_name = "${var.project_name}-${var.environment}" }      # computed internal values
+data "aws_availability_zones" "available" { state = "available" }       # READ existing things
+resource "aws_vpc" "main" { cidr_block = var.vpc_cidr }                 # CREATE things
+output "cluster_ca" { value = module.eks.cluster_certificate_authority_data  sensitive = true }
+```
+
+**Meta-arguments**
+
+| | Use | Gotcha |
+|---|---|---|
+| `count` | N identical resources, indexed `[0]`,`[1]` | remove item 0 → everything shifts → recreate |
+| `for_each` | resources from a **map/set**, addressed by key | **preferred** — stable addresses |
+| `depends_on` | when Terraform can't infer the dependency | use sparingly |
+| `lifecycle` | `prevent_destroy`, `ignore_changes` (e.g. `desired_size` owned by Cluster Autoscaler), `create_before_destroy` | without `ignore_changes`, TF fights CA forever |
+| `dynamic` blocks | generate repeated nested blocks (taints, routes) | |
+| provisioners | run commands after create | last resort |
+
+Pin provider versions with `~>` (never `latest`).
+
+## C.2 Modules — LEGO bricks
+
+Spaghetti = one 2000-line file, impossible to reuse or reason about. A module has **inputs (variables) → logic → outputs**; the **root/environment module** wires them.
+
+```
+terraform/
+├── environments/{production,staging,dev}/   main.tf variables.tf outputs.tf terraform.tfvars backend.tf
+└── modules/{vpc,iam,eks,rds,irsa}/          main.tf variables.tf outputs.tf README.md
+```
+**Rule: modules contain NO environment-specific values.** Variables make them specific; `environments/*/main.tf` supplies the values. Same module → prod, staging, dev.
+
+### Module: VPC (core resources)
+```hcl
+locals {
+  azs               = slice(data.aws_availability_zones.available.names, 0, length(var.private_subnet_cidrs))
+  nat_gateway_count = var.single_nat_gateway ? 1 : length(var.public_subnet_cidrs)   # HA vs cost
+}
+resource "aws_vpc" "main" {
+  cidr_block = var.vpc_cidr  enable_dns_hostnames = true  enable_dns_support = true
+  tags = merge(var.tags, { Name = "${var.cluster_name}-vpc", "kubernetes.io/cluster/${var.cluster_name}" = "shared" })
+}
+resource "aws_subnet" "public" {
+  count = length(var.public_subnet_cidrs)
+  vpc_id = aws_vpc.main.id  cidr_block = var.public_subnet_cidrs[count.index]
+  availability_zone = local.azs[count.index]  map_public_ip_on_launch = true
+  tags = merge(var.tags, { "kubernetes.io/role/elb" = "1", "kubernetes.io/cluster/${var.cluster_name}" = "shared" })
+}
+resource "aws_subnet" "private" {   # tags: kubernetes.io/role/internal-elb = 1, cluster/<name> = owned
+  count = length(var.private_subnet_cidrs)  vpc_id = aws_vpc.main.id
+  cidr_block = var.private_subnet_cidrs[count.index]  availability_zone = local.azs[count.index]
+}
+# + aws_internet_gateway, aws_eip.nat, aws_nat_gateway.main (count = nat_gateway_count),
+#   public route table → IGW, private route table(s) → NAT (dynamic "route"), associations,
+#   aws_vpc_endpoint (S3 Gateway; Interface endpoints behind a var)
+output "vpc_id"             { value = aws_vpc.main.id }
+output "private_subnet_ids" { value = aws_subnet.private[*].id }
+output "public_subnet_ids"  { value = aws_subnet.public[*].id }
+```
+
+### Modules: IAM + EKS — and the dependency trap
+
+> ⚠️ **Circular-dependency bug in the source material.** The example had `module.iam` consume `module.eks.oidc_provider_url` while `module.eks` consumed `module.iam.cluster_role_arn`. Terraform rejects that cycle. **Fix: split IAM in two.**
+>
+> - **`iam-base`** → cluster role + node role (needed *before* EKS)
+> - **`irsa`** → IRSA roles (ALB controller, cluster autoscaler…) that need the cluster's OIDC provider (created *after* EKS)
+
+```hcl
+# iam-base: roles EKS needs to exist
+data "aws_iam_policy_document" "eks_cluster_assume" {
+  statement { effect = "Allow"  actions = ["sts:AssumeRole"]
+              principals { type = "Service"  identifiers = ["eks.amazonaws.com"] } }
+}
+resource "aws_iam_role" "eks_cluster" { name = "${var.cluster_name}-cluster-role"
+  assume_role_policy = data.aws_iam_policy_document.eks_cluster_assume.json }
+resource "aws_iam_role_policy_attachment" "eks_cluster" { role = aws_iam_role.eks_cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy" }
+# node role: trust ec2.amazonaws.com; attach AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy,
+#            AmazonEC2ContainerRegistryReadOnly (for_each over a toset of ARNs)
+
+# irsa: trust = Federated OIDC provider + conditions on :aud (sts.amazonaws.com) and :sub
+#       (system:serviceaccount:<ns>:<sa>) → sts:AssumeRoleWithWebIdentity
+```
+
+```hcl
+# eks
+resource "aws_eks_cluster" "main" {
+  name = var.cluster_name  version = var.cluster_version  role_arn = var.cluster_role_arn
+  vpc_config { subnet_ids = var.subnet_ids  endpoint_private_access = true  endpoint_public_access = false }
+  enabled_cluster_log_types = ["api","audit","authenticator","controllerManager","scheduler"]
+  encryption_config { provider { key_arn = aws_kms_key.eks.arn }  resources = ["secrets"] }   # etcd secrets via KMS
+  depends_on = [aws_cloudwatch_log_group.eks]
+}
+resource "aws_kms_key" "eks" { description = "EKS secrets ${var.cluster_name}"  enable_key_rotation = true
+                               deletion_window_in_days = 7 }
+data "tls_certificate" "eks" { url = aws_eks_cluster.main.identity[0].oidc[0].issuer }
+resource "aws_iam_openid_connect_provider" "eks" {                         # → enables IRSA
+  client_id_list = ["sts.amazonaws.com"]  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
+  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
+}
+resource "aws_eks_node_group" "this" {
+  for_each = var.node_groups
+  cluster_name = aws_eks_cluster.main.name  node_group_name = each.key
+  node_role_arn = var.node_role_arn  subnet_ids = var.subnet_ids
+  instance_types = each.value.instance_types  capacity_type = each.value.capacity_type
+  scaling_config { min_size = each.value.min_size  max_size = each.value.max_size  desired_size = each.value.desired_size }
+  update_config { max_unavailable = 1 }
+  labels = each.value.labels
+  dynamic "taint" { for_each = each.value.taints
+                    content { key = taint.value.key  value = taint.value.value  effect = taint.value.effect } }
+  lifecycle { ignore_changes = [scaling_config[0].desired_size] }          # Cluster Autoscaler owns this
+}
+resource "aws_eks_addon" "this" { for_each = toset(["vpc-cni","coredns","kube-proxy","aws-ebs-csi-driver"])
+  cluster_name = aws_eks_cluster.main.name  addon_name = each.key
+  resolve_conflicts_on_update = "OVERWRITE"  depends_on = [aws_eks_node_group.this] }
+output "oidc_provider_url" { value = trimprefix(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://") }
+```
+
+### Root module (production) — wiring
+```hcl
+module "vpc"      { source = "../../modules/vpc"      cluster_name = local.cluster_name
+                    vpc_cidr = var.vpc_cidr  single_nat_gateway = false  tags = local.common_tags }
+module "iam_base" { source = "../../modules/iam-base" cluster_name = local.cluster_name  tags = local.common_tags }
+module "eks" {
+  source = "../../modules/eks"
+  cluster_name = local.cluster_name  cluster_version = var.eks_version
+  cluster_role_arn = module.iam_base.cluster_role_arn  node_role_arn = module.iam_base.node_role_arn
+  subnet_ids = module.vpc.private_subnet_ids  vpc_id = module.vpc.vpc_id
+  node_groups = {
+    system = { instance_types = ["t3.medium"], capacity_type = "ON_DEMAND", min_size = 2, max_size = 4, desired_size = 2,
+               labels = { "workload-type" = "infrastructure" },
+               taints = [{ key = "workload-type", value = "infrastructure", effect = "NO_SCHEDULE" }] }
+    app    = { instance_types = ["t3.medium","t3a.medium","m5.large"], capacity_type = "SPOT",
+               min_size = 2, max_size = 20, desired_size = 3, labels = { "workload-type" = "application" }, taints = [] }
+  }
+  tags = local.common_tags
+}
+module "irsa" { source = "../../modules/irsa"  cluster_name = local.cluster_name
+                account_id = data.aws_caller_identity.current.account_id
+                oidc_provider_url = module.eks.oidc_provider_url }       # after EKS ✔ no cycle
+# + provider "kubernetes"/"helm" using module.eks outputs and `aws eks get-token`
+# + helm_release for aws-load-balancer-controller and cluster-autoscaler (set serviceAccount role-arn annotation)
+```
+
+## C.3 State management — the most critical skill
+
+**Create the backend BEFORE `terraform init`:**
+```bash
+aws s3api create-bucket --bucket $STATE_BUCKET --region us-east-1
+aws s3api put-bucket-versioning  --bucket $STATE_BUCKET --versioning-configuration Status=Enabled   # rollback!
+aws s3api put-bucket-encryption  --bucket $STATE_BUCKET --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}'
+aws s3api put-public-access-block --bucket $STATE_BUCKET --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+aws dynamodb create-table --table-name terraform-state-lock \
+  --attribute-definitions AttributeName=LockID,AttributeType=S --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST
+```
+(Optional: MFA-delete; bucket policy denying `s3:DeleteObject` to everyone except the CI role; DynamoDB PITR; periodic `terraform state pull` backups.)
+
+**Toolkit**
+
+| Command | Use |
+|---|---|
+| `terraform state list` / `state show <addr>` | inspect what Terraform owns |
+| `terraform state mv <old> <new>` | **rename without destroying** (renamed resource/module in code) |
+| `terraform state rm <addr>` | forget a resource (**still exists in AWS**; plan may try to create a duplicate) |
+| `terraform import <addr> <id>` | adopt an existing AWS resource into state |
+| `terraform refresh` | sync state to reality (doesn't touch `.tf`) |
+| `terraform show -json \| jq …` | script against state |
+| `terraform state pull > backup.json` / `state push` | backup / recovery (push is dangerous) |
+| `terraform force-unlock <ID>` | clear a stuck lock — **only if you're sure no apply is running** |
+
+## C.4 Break the state and recover — the most important lab
+
+| # | Scenario | Symptom | Recovery |
+|---|---|---|---|
+| 1 | **Stuck lock** (apply crashed) | "Error acquiring the state lock" | `aws dynamodb scan --table-name terraform-state-lock` → `terraform force-unlock <LOCK_ID>` |
+| 2 | **Resource deleted in console** | refresh/plan: "couldn't find resource" | A) `apply` recreates it · B) `state rm` + `import` the manually made replacement |
+| 3 | **Corrupt state** | JSON parse error | `aws s3api list-object-versions` → `get-object --version-id <prev>` → `jq '.version'` to validate → `terraform state push` → `plan` (should be ~no changes) |
+| 4 | **Drift** (console change, e.g. SG port 80→8080) | plan shows unexpected `~` | accept (edit code to match) or reject (`apply` reverts it). *This is why no console clicks.* |
+| 5 | **Module renamed** (`old_vpc` → `vpc`) | plan: **destroy old + create new → deletes the VPC** | `terraform state mv module.old_vpc.aws_vpc.main module.vpc.aws_vpc.main` for **every** resource (quote indexed addresses `'module.vpc.aws_subnet.private[0]'`); plan → "No changes" |
+| 6 | **Total state loss** | plan wants to create everything | restore from S3 version; else `terraform import` each resource (hours). **Prevention:** versioning, delete-deny policy, PITR, regular `state pull` |
+
+> In Terraform ≥ 1.1 you can also declare renames in code with `moved { from = … to = … }` blocks — reviewable in a PR instead of ad-hoc `state mv`.
+
+## C.5 The full workflow (follow every time)
+
+```bash
+cd environments/production
+terraform init                       # providers + backend
+terraform fmt -recursive ../..
+terraform validate
+terraform plan -out=tfplan           # READ IT. Unexpected destroy? STOP.
+terraform show tfplan
+terraform apply tfplan               # applies exactly what you reviewed
+terraform output
+eval $(terraform output -raw configure_kubectl) && kubectl get nodes
+```
+Targeted work: `apply -target=module.eks` (surgical/debugging only) · `plan -refresh=false` (faster, careful) · `plan -destroy` (preview) · prod `destroy` needs business approval + RDS snapshots.
+**Team flow:** PR → `fmt --check`, `validate`, security scans, `plan` posted as a PR comment → review/approve → merge → `apply`. Full audit trail in Git.
+
+## C.6 ArgoCD — GitOps for Kubernetes
+
+**Mental model — a sync robot.** It watches Git; when Git changes it syncs the cluster; the cluster always reflects Git. *Nobody applies YAML directly — Git is the only door.*
+
+```
+WITHOUT: kubectl apply …  ← who ran it? when? which version?    helm upgrade …  ← does the cluster match? who knows?
+WITH:    git commit -m "nginx 1.25" && git push → ArgoCD sees Git ≠ cluster → applies the diff → Git history IS the deploy history
+```
+
+| Concept | Meaning |
+|---|---|
+| **Application** | "watch this Git repo/path → sync to this cluster/namespace" (automatic or manual) |
+| **Repository** | Git repo ArgoCD can read (manifests, Helm, Kustomize) |
+| **Project** | grouping + access control (allowed repos/clusters/who) |
+| **Sync** | `Synced` ✅ · `OutOfSync` · `Unknown` (can't reach Git) |
+| **Health** | `Healthy` ✅ · `Degraded` · `Progressing` · `Suspended` |
+| **selfHeal** | auto-revert manual cluster changes |
+| **prune** | delete cluster resources that were removed from Git |
+
+**GitOps repo (separate from app code):**
+```
+gitops/
+├── apps/production/        ← ArgoCD Application objects (root-app, api-app, monitoring-app…)
+├── infrastructure/         ← cluster tooling: cert-manager, ingress, prometheus-stack, cluster-autoscaler
+└── applications/api/{base/, overlays/{production,staging}/}      ← Kustomize
+```
+
+**Install via Terraform `helm_release` (6.4.0 in the source):** HA replicas, ingress, `application.namespaces`, RBAC (`policy.default: role:readonly`; `platform-engineer` can do everything; `developer` can `get` but is **denied `sync` on `production/*`**).
+
+**App of Apps — one root Application creates all the others**
+```hcl
+resource "kubernetes_manifest" "root_app" { manifest = {
+  apiVersion = "argoproj.io/v1alpha1"  kind = "Application"
+  metadata = { name = "root-app", namespace = "argocd", finalizers = ["resources-finalizer.argocd.argoproj.io"] }
+  spec = { project = "default"
+    source = { repoURL = var.gitops_repo_url, targetRevision = "main", path = "apps/production" }
+    destination = { server = "https://kubernetes.default.svc", namespace = "argocd" }
+    syncPolicy = { automated = { prune = true, selfHeal = true }, syncOptions = ["CreateNamespace=true","ServerSideApply=true"] } } }
+  depends_on = [helm_release.argocd] }
+```
+
+**Application definition**
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-production
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: production
+  source: { repoURL: https://github.com/myorg/gitops, targetRevision: main, path: applications/api/overlays/production }
+  destination: { server: https://kubernetes.default.svc, namespace: production }
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true, PrunePropagationPolicy=foreground, ApplyOutOfSyncOnly=true]
+    retry: { limit: 3, backoff: { duration: 5s, factor: 2, maxDuration: 3m } }
+  revisionHistoryLimit: 10
+  ignoreDifferences:                     # let HPA / external controllers own these
+  - { group: apps, kind: Deployment, jsonPointers: [/spec/replicas] }
+```
+
+**Kustomize overlays** — base is generic; overlays carry only what differs:
+```yaml
+# overlays/production/kustomization.yaml            # overlays/staging → replicas 1, newTag "v1.25.0-rc1"
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: [../../base]                              # (`bases:` is deprecated)
+namespace: production
+images: [{ name: ghcr.io/myorg/api, newTag: "v1.24.5" }]      # CI rewrites this line on every deploy
+patches:
+- target: { kind: Deployment, name: api }
+  patch: |-
+    - { op: replace, path: /spec/replicas, value: 3 }
+    - { op: replace, path: /spec/template/spec/containers/0/resources,
+        value: { requests: { cpu: 200m, memory: 256Mi }, limits: { cpu: "1", memory: 512Mi } } }
+```
+(The source put two patch entries under one `patches:` key in a way that isn't valid YAML — keep them in a single `patches:` list as above.)
+
+## C.7 Checklist
+
+**Explain without notes:** state file & why it's sacred · what two simultaneous applies do · plan vs apply · why prod `destroy` is dangerous · module pattern · `count` vs `for_each` · `state mv` · GitOps & "Git is the only door" · selfHeal · App of Apps.
+**Labs:** state bucket + lock table · vpc/iam/eks modules · root wiring · `init → plan → apply` · `kubectl get nodes` · ArgoCD via `helm_release` · root app → children synced · staging overlay with different replicas · stuck lock → `force-unlock` · rename module → `state mv` with no destroy · console change → drift → `apply` reverts · restore previous state version · image-tag change in gitops repo → auto-sync → new pod.
+**Habits:** never apply unseen plans · never console-click managed resources · always remote state · pin providers · `ignore_changes` for externally-managed fields · protect state (versioning/encryption/delete protection) · tag everything · PR review for infra · **never** secrets in `.tfvars`/`.tf` · **never** commit `terraform.tfstate`.
+
+---
+
+# D. CI/CD + GitOps
+
+> Make the platform **self-operating**: push code → pipeline lints, scans, enforces policy, plans infra, deploys apps, and detects/fixes drift. The human leaves the critical path.
+
+## D.0 End-to-end pipeline
+
+```
+git push
+  └─ CI (GitHub Actions)
+       1 CODE QUALITY   lint · format · unit tests
+       2 SECURITY       trivy · tfsec · checkov · semgrep · secret scanning
+       3 POLICY         OPA/conftest · kyverno CLI · infracost
+       4 BUILD          build image → scan → push → cosign sign
+       5 TERRAFORM      fmt · validate · plan (as PR comment) · apply on merge
+  └─ GitOps (ArgoCD)    CI bumps image tag in Git → ArgoCD detects → diffs → applies → reports status
+  └─ PRODUCTION UPDATED — zero human intervention after git push
+```
+
+| Stage | Analogy |
+|---|---|
+| Lint | spell-checker — catches obvious mistakes cheaply |
+| Security | airport scanner — nothing boards the cluster unscanned |
+| Policy | legal department — it works, but does it follow the rules? |
+| Plan | showing your homework — reviewers see exactly what changes in AWS |
+| GitOps | robot ops team — never sleeps, always syncs to Git |
+
+## D.1 The toolchain
+
+| Group | Tool | Does |
+|---|---|---|
+| Lint | hadolint · tflint · yamllint · shellcheck · markdownlint | Dockerfiles · Terraform · YAML · shell · docs |
+| Security | **trivy** | the all-rounder: images, fs, repos, IaC, k8s, secrets (SARIF → GitHub Security tab) |
+| | tfsec | Terraform-specific (unencrypted S3, 0.0.0.0/0 SSH, wildcard IAM, RDS w/o deletion protection) |
+| | checkov | multi-framework IaC (Terraform, CFN, k8s, Dockerfile), 1000+ checks, custom Python checks |
+| | semgrep | code patterns (SQLi, hardcoded secrets, insecure crypto, OWASP Top 10) |
+| | gitleaks | secrets across **all git history** (catches "I'll just commit it for now") |
+| Policy | conftest (OPA/Rego) | custom rules over IaC/k8s/plan JSON |
+| | kyverno CLI | test Kyverno policies offline against manifests |
+| | infracost | cost of a plan; fail above a budget |
+| GitOps | argocd · argocd-image-updater | sync; auto-bump image tags from the registry |
+
+## D.2 Three repositories
+
+```
+app-repo      src/ tests/ Dockerfile .github/workflows/{ci.yaml,pr-checks.yaml} .trivyignore
+infra-repo    modules/ environments/{production,staging}/ policies/terraform/ .tflint.hcl
+              .github/workflows/{terraform-pr.yaml,terraform-apply.yaml,security-scan.yaml}
+gitops-repo   apps/ infrastructure/ applications/ policies/kubernetes/
+              .github/workflows/{validate.yaml,drift-report.yaml}
+```
+
+## D.3 Application CI (`ci.yaml`) — job by job
+
+Common: `concurrency: group: ${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true` · minimal `permissions:` · `needs:` to order jobs (cheap/fast first).
+
+1. **lint** — hadolint (`failure-threshold: warning`), yamllint, shellcheck, ruff/golangci-lint.
+2. **test** (`needs: lint`) — service containers (e.g. postgres with health checks), `pytest --cov=src --cov-fail-under=80`.
+3. **secret-scan** — `fetch-depth: 0` (full history) → gitleaks + trufflehog (`--only-verified`).
+4. **security-scan** — `trivy fs` (`exit-code: 1`, `severity: CRITICAL,HIGH`, `ignore-unfixed: true`, SARIF upload with `if: always()`), semgrep rule packs, bandit.
+5. **build** — buildx → **build with `push: false, load: true`** → **trivy image scan** → **push only after the scan passes** → `cosign sign --yes <image>@<digest>` (keyless via Sigstore/OIDC, needs `id-token: write`).
+6. **policy-check** — install conftest + kyverno CLI → `conftest test k8s/ --policy policies/kubernetes/` → `kyverno apply policies/kyverno/ --resource k8s/`.
+7. **update-gitops** (`if: main && push`) — check out the gitops repo with a PAT, `sed` the new tag into `applications/api/overlays/production/kustomization.yaml`, commit, push → ArgoCD syncs.
+
+```yaml
+# the gitops-update step (the hand-off from CI to GitOps)
+- run: |
+    sed -i "s|newTag:.*|newTag: \"${IMAGE_TAG}\"|" applications/api/overlays/production/kustomization.yaml
+    git config user.email "ci-bot@mycompany.com"; git config user.name "CI Bot"
+    git add -A; git diff --staged --quiet || git commit -m "deploy(api): ${IMAGE_TAG} to production"; git push
+```
+Pitfall: `trufflehog@main` and `trivy-action@master` float — pin to a release/commit SHA in real pipelines (supply-chain hygiene).
+
+## D.4 Terraform pipelines
+
+**On PR** (`terraform-pr.yaml`; permissions `pull-requests: write`, `id-token: write`, `security-events: write`):
+- **terraform-security:** tfsec (`--minimum-severity HIGH`), checkov (`skip_check` only for documented exceptions), trivy `scan-type: config`.
+- **terraform-policy:** OIDC to AWS → `terraform plan -out=tfplan.binary` → `terraform show -json tfplan.binary > tfplan.json` → `conftest test tfplan.json --policy policies/terraform/`.
+- **cost-estimation:** `infracost breakdown` → `infracost diff` → PR comment (`--behavior update`) → **fail if monthly delta > threshold** (e.g. $200).
+- **terraform-plan** (`needs: security, policy`): fmt check → init → validate → `plan -detailed-exitcode` (0 = no change, 1 = error, 2 = changes) → post a PR comment with ➕/🟡/🔴 counts and the collapsible full plan (GitHub comments cap at 65 535 chars — truncate).
+
+**On merge** (`terraform-apply.yaml`): `environment: production` (required reviewers) → init → **plan again** → `apply -auto-approve tfplan.binary` → Slack notify on success/failure. AWS auth is **OIDC role assumption (`terraform-ci-role`)**, never static keys.
+
+## D.5 Policy as code (Rego)
+
+**Terraform plan policies** (`deny` blocks the plan, `warn` only alerts):
+```rego
+package main
+import future.keywords.contains
+import future.keywords.if
+import future.keywords.in
+
+deny contains msg if {                       # S3 without encryption
+  r := input.resource_changes[_]; r.type == "aws_s3_bucket"; r.change.actions[_] == "create"
+  not r.change.after.server_side_encryption_configuration
+  msg := sprintf("S3 bucket '%v' must have server-side encryption", [r.name])
+}
+deny contains msg if {                       # destroying critical resources
+  r := input.resource_changes[_]; r.change.actions[_] == "delete"
+  r.type in {"aws_eks_cluster", "aws_db_instance", "aws_vpc"}
+  msg := sprintf("CRITICAL: plan would DESTROY %v '%v' — explicit approval required", [r.type, r.name])
+}
+```
+Other rules: no SSH from `0.0.0.0/0` · RDS needs `deletion_protection` · EKS must not have a public endpoint · no IAM `Action:* Resource:*` · required tags `{Environment, ManagedBy, Project}` · warn on old t2 types and RDS backup retention < 7 days.
+
+**Kubernetes manifest policies:** deny root containers · require resource limits · require `readinessProbe` · deny `:latest` · deny privileged · require namespace · warn on multi-replica without anti-affinity and on single replica in `production`.
+> Note: newer Conftest/OPA versions use Rego v1 syntax (`deny contains msg if { … }`); older `deny[msg] { … }` still works under `import rego.v1`-less setups. Match your Conftest version.
+
+## D.6 ArgoCD operations
+
+**Notifications** (`argocd-notifications-cm`): templates `app-deployed`, `app-sync-failed`, `app-health-degraded`; triggers `on-deployed` (`Synced` and `Healthy`), `on-sync-failed`, `on-health-degraded`; per-app annotations `notifications.argoproj.io/subscribe.<trigger>.slack: <channel>`.
+
+**Sync waves = deployment order** (`argocd.argoproj.io/sync-wave: "N"`, lower first, each wave must be Healthy before the next): cert-manager (1) → ingress controller (2) → monitoring (3) → apps (4). Without waves, an app needing cert-manager CRDs fails because they don't exist yet.
+
+**Resource hooks:** `PreSync` · `Sync` · `PostSync` · `SyncFail` — e.g. a DB-migration Job before the new version:
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+  annotations: { argocd.argoproj.io/hook: PreSync, argocd.argoproj.io/hook-delete-policy: BeforeHookCreation }
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - { name: migrate, image: "ghcr.io/myorg/api:<tag>", command: ["python","manage.py","migrate","--noinput"],
+          env: [{ name: DATABASE_URL, valueFrom: { secretKeyRef: { name: db-credentials, key: url } } }] }
+```
+
+## D.7 Break reconciliation & fix drift (labs)
+
+| Drift / failure | What happens | Result |
+|---|---|---|
+| `kubectl scale deployment api --replicas=1` | OutOfSync → selfHeal re-applies Git | back to Git's replicas in < ~30 s |
+| `kubectl set image … nginx:1.19` | image differs → reverted | wrong pod terminated, correct one starts |
+| `kubectl delete configmap app-config` | in Git, not in cluster → recreated | app recovers |
+| `kubectl apply` a ConfigMap not in Git | `prune: true` deletes it | **everything must be in Git** |
+| **Invalid YAML pushed** | API rejects → Sync Failed → Slack alert | **old pods keep running**; fix: `git revert HEAD --no-edit && git push` |
+| **ArgoCD can't reach Git** (bad creds → 401) | app `Unknown`; cluster unchanged | safe; restore creds, `argocd repo list` shows Connected |
+| **ArgoCD down** | nothing syncs | cluster runs as-is — safe failure |
+
+> **Key insight: the system fails conservatively.** Bad commit → sync fails → old version keeps serving → alert → fix. ArgoCD down → nothing changes. It never breaks what was working.
+
+**Faster detection:** default poll is ~3 min; add a GitHub **webhook** (`/api/webhook`, secret in `argocd-secret`) → sync within seconds of a push.
+**Diagnose:** `argocd app get api-production` · `argocd app sync api-production --dry-run` · `argocd app get … -o json | jq '.status.conditions[] | select(.type=="SyncError")'`.
+
+## D.8 Full GitOps workflow (what to time and record)
+
+1. Dev pushes → CI starts (~10 s) → lint (~30 s) → scans (~2–3 min) → image built/scanned/signed/pushed (~3 min) → gitops repo updated.
+2. ArgoCD detects (instant with webhook) → OutOfSync → applies only the Deployment diff → rolling update (`maxSurge 1, maxUnavailable 0`).
+3. Verify: `argocd app get`, `kubectl get pods -o jsonpath` shows the new image, **`cosign verify --certificate-identity-regexp … --certificate-oidc-issuer https://token.actions.githubusercontent.com <image>@sha256:…`** (unsigned = reject), health endpoint OK, `argocd app history`.
+4. **Rollback:** (A) `argocd app rollback api-production` or (B) **`git revert HEAD --no-edit && git push`** — the proper GitOps way (history preserved; use *revert*, never *reset*).
+
+Example latency story (illustrative): push → ~6–8 min → production updated; MTTR ≈ 2 min via revert.
+
+**gitops-repo CI** (`validate.yaml`, on PR): yamllint → `kustomize build` every overlay → schema validation (**kubeconform**; kubeval is unmaintained) → conftest on rendered manifests (split multi-doc output, test each) → `argocd app diff --local` posted as a PR comment.
+
+## D.9 Security gates & runbook
+
+| Gate | Tool | Blocks on |
+|---|---|---|
+| 1 Secrets | gitleaks / trufflehog | any verified secret |
+| 2 Code | semgrep / bandit | HIGH |
+| 3 Container | trivy image | CRITICAL/HIGH |
+| 4 IaC | tfsec / checkov / trivy | CRITICAL/HIGH |
+| 5 Policy | conftest / kyverno | any violation |
+| 6 Cost | infracost | > threshold |
+| 7 Signature | cosign verify (admission) | unsigned images |
+
+```bash
+git revert HEAD --no-edit && git push        # emergency rollback (< 2 min)   |  argocd app rollback api-production
+argocd app sync api-production               # force sync
+argocd app set api-production --sync-policy none        # maintenance (disable auto-sync)
+argocd app set api-production --sync-policy automated   # re-enable
+argocd app list | grep OutOfSync             # what drifted, across all apps
+argocd app diff api-production               # cluster vs Git
+argocd app get api-production --hard-refresh # ignore cache, re-fetch Git
+argocd app history api-production
+```
+**DORA-style metrics to measure:** deployment frequency · lead time for changes · MTTR · change-failure rate.
+
+## D.10 Checklist
+
+**Explain:** what lint catches that tests don't · why scan **all** git history for secrets · tfsec vs checkov · what conftest/Rego does · why scan the image **before** push · cosign keyless/OIDC · **prune vs selfHeal** · sync waves · why ArgoCD down is safe · hooks · GitOps vs imperative rollback.
+**Labs:** all stages on a real push · break hadolint · fake AWS key → gitleaks blocks · vulnerable image → trivy blocks · no limits → conftest blocks · expensive resource → infracost blocks · plan posted as PR comment · apply on merge · selfHeal on manual scale · prune on stray ConfigMap · broken YAML → old version keeps running · revert → recovers · push→prod timing · sync waves (cert-manager before app).
+**Habits:** never `kubectl apply` in prod · never bypass the pipeline (revert is faster) · check `argocd app list` before assuming state · revert not reset · Slack alerts always · test pipeline changes on a staging branch · secrets via External Secrets Operator, never Git · sign images and verify at admission · never `prune: false` in prod · read the infracost comment before approving IaC PRs.
+
+---
+
+# E. Cost Domination
+
+> Cost optimization isn't being cheap — it's being **precise**: pay for exactly what delivers value, understand every dollar on the bill. Typical target on an unoptimized account: **40–60% reduction with zero reliability regression.**
+
+## E.0 The four categories of waste
+
+| # | Category | Examples |
+|---|---|---|
+| 1 | **Idle resources** (worst) | dev at night/weekends, unused bastions, instances at 3% CPU |
+| 2 | **Over-provisioned** | pod requests 4 CPU / uses 0.2 · `t3.xlarge` where `t3.small` fits · 100 GB EBS with 15 GB used |
+| 3 | **Full price for interruptible work** | stateless pods on On-Demand · no Savings Plans on a stable baseline |
+| 4 | **Inefficient data movement** | S3 through NAT (no VPC endpoint) · inter-AZ transfer · no CDN |
+
+## E.1 Audit first — find every dollar
+
+```bash
+# 1 Big picture: spend by service, last 90 days
+aws ce get-cost-and-usage --time-period Start=$(date -d '90 days ago' +%F),End=$(date +%F) \
+  --granularity MONTHLY --metrics UnblendedCost --group-by Type=DIMENSION,Key=SERVICE
+
+# 2 Compute: all running instances + 14-day CPU (flag avg < 10%)
+aws ec2 describe-instances --filters Name=instance-state-name,Values=running \
+  --query 'Reservations[*].Instances[*].{ID:InstanceId,Type:InstanceType,Name:Tags[?Key==`Name`]|[0].Value}'
+aws cloudwatch get-metric-statistics --namespace AWS/EC2 --metric-name CPUUtilization \
+  --dimensions Name=InstanceId,Value=$ID --start-time … --end-time … --period 1209600 --statistics Average Maximum
+
+# 3 Pods: requested vs actual → where you overpay
+kubectl top pods -A      # compare to each pod's resources.requests
+
+# 4 Storage waste
+aws ec2 describe-volumes --filters Name=status,Values=available            # unattached = pure waste
+aws ec2 describe-volumes --filters Name=volume-type,Values=gp2            # should be gp3 (~20% cheaper)
+aws ec2 describe-snapshots --owner-ids self --query "Snapshots[?StartTime<='<90d ago>']"
+
+# 5 NAT: count × $0.045/h fixed + $0.045/GB processed
+aws ec2 describe-nat-gateways --filter Name=state,Values=available
+aws cloudwatch get-metric-statistics --namespace AWS/NATGateway --metric-name BytesOutToDestination …
+# 6 S3 by storage class (list-objects-v2 → group by StorageClass → price per class)
+```
+
+## E.2 Spot — ~70% off compute
+
+| | On-Demand | Spot (typical) | Saving |
+|---|---|---|---|
+| m5.large | $0.096/h ($70/mo) | $0.028/h ($20/mo) | ~71% |
+| t3.medium | $0.0416/h | $0.0125/h | ~70% |
+
+10-node cluster: 10 OD = $701/mo · 10 Spot = $204/mo · **2 OD + 8 Spot = $304/mo** (saves ~$397/mo from one change).
+**Strategy:** On-Demand baseline (system, ArgoCD, monitoring) · Spot for stateless/batch/dev · **6–10 instance types across 2+ AZs** · Node Termination Handler. (Full detail in [Module B.3](#b3-spot-instances--cheap-capacity-with-teeth).)
+
+```hcl
+locals { spot_instance_types = ["m5.large","m5a.large","m5n.large","m5d.large","m4.large","m6i.large","m6a.large","t3.large","t3a.large","r5.large"] }
+resource "aws_eks_node_group" "spot" {
+  cluster_name = aws_eks_cluster.main.name  node_group_name = "spot-workers"  node_role_arn = var.node_role_arn
+  subnet_ids = var.private_subnet_ids  capacity_type = "SPOT"  instance_types = local.spot_instance_types
+  scaling_config { min_size = 0  max_size = 50  desired_size = 3 }
+  labels = { "capacity-type" = "spot", "node.kubernetes.io/lifecycle" = "spot" }
+  taint { key = "capacity-type"  value = "spot"  effect = "NO_SCHEDULE" }
+  lifecycle { ignore_changes = [scaling_config[0].desired_size] }
+}
+# + an ON_DEMAND "system" group: min 2 for HA, tainted workload-type=system
+```
+Pods: tolerate the spot taint, prefer spot via node affinity, `terminationGracePeriodSeconds: 90`, `preStop` drain sleep. Install NTH (`enableSpotInterruptionDraining`, `enableRebalanceMonitoring`, …).
+
+## E.3 Graviton (ARM) — cheaper **and** faster
+
+AWS-designed ARM chips: ~20% cheaper than comparable x86 **and** 20–40% better performance → often downsize a class. `m5.large` $0.096/h vs `m6g.large` $0.077/h. Containers built for `linux/arm64` (Java, Python, Go, Node, Ruby…) run unchanged; only native x86-compiled code needs rebuilding (rare, ~5% of modern apps).
+
+```yaml
+# CI: build both architectures in one command
+- uses: docker/setup-qemu-action@v3
+- uses: docker/setup-buildx-action@v3
+- uses: docker/build-push-action@v5
+  with: { context: ., platforms: "linux/amd64,linux/arm64", push: true, tags: ghcr.io/myorg/api:${{ github.sha }} }
+```
+**Node group:** Graviton + Spot (`m6g/m7g/c6g/c7g/r6g/t4g` mix) with label `kubernetes.io/arch=arm64`; Graviton On-Demand (`m7g.medium`, `m6g.medium`) for system nodes.
+
+**Zero-downtime migration playbook:**
+1. Build multi-arch image → `docker buildx imagetools inspect <img>` shows **both** platforms
+2. Add Graviton node group (`terraform apply -target=…`)
+3. Run **one test pod** with `nodeSelector kubernetes.io/arch: arm64`; confirm `…nodeInfo.architecture == arm64`; check logs
+4. Patch the Deployment (preferred arch affinity) → rolling update → verify pods on ARM nodes
+5. **Benchmark** arm64 vs amd64 (same load tool, same image) — prove it
+6. Cordon + drain x86 nodes → remove the x86 node group from Terraform
+Rollback = cordon Graviton nodes.
+
+## E.4 Rightsizing — pay for what you use
+
+```bash
+# VPA in RECOMMENDATION-ONLY mode ("Off"): watches usage, changes nothing
+cat << EOF | kubectl apply -f -
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata: { name: api-vpa, namespace: production }
+spec: { targetRef: { apiVersion: apps/v1, kind: Deployment, name: api }, updatePolicy: { updateMode: "Off" } }
+EOF
+# wait 24–48h → kubectl get vpa -o yaml → target/lowerBound/upperBound per container
+aws compute-optimizer update-enrollment-status --status Active       # free; EC2 + EBS recommendations
+aws compute-optimizer get-ec2-instance-recommendations
+```
+Rule of thumb: set **requests ≈ P50–P90 real usage with a buffer** (e.g. request 100m where average is 45m and max 380m; limit 500m). Lower requests → scheduler packs more per node → CA provisions fewer nodes → **direct cost drop** (and HPA math gets accurate).
+
+## E.5 Eliminate idle (scale non-prod to zero)
+
+- **KEDA** `ScaledObject`: `minReplicaCount: 0`, `cooldownPeriod: 300`; triggers = Prometheus request rate (≥1 req wakes it) or **cron** (`start: 0 8 * * 1-5`, `end: 0 18 * * 1-5`, `desiredReplicas: "2"`).
+- **EventBridge + Lambda** (or Terraform `aws_cloudwatch_event_rule` with `cron(0 19 ? * MON-FRI *)` / `cron(0 8 ? * MON-FRI *)`) → `eks.update_nodegroup_config(... desiredSize=0 / 3)`.
+- **Math (illustrative):** 3 × t3.medium dev = $91/mo; running 40 h/wk instead of 168 → **~76% off ≈ $69/mo saved**.
+
+## E.6 NAT Gateway & data-movement costs
+
+| Item | Cost |
+|---|---|
+| NAT fixed | $0.045/h = **$32.85/mo each** (2 NATs = $65.70) |
+| NAT processing | $0.045/GB (1 TB ≈ $45) |
+| Inter-AZ | ~$0.01/GB each way (≈$0.02 round trip) |
+
+**Biggest NAT traffic sources → fixes:** S3 → **Gateway endpoint (free)** · DynamoDB → **Gateway endpoint (free)** · ECR pulls → Interface endpoint · CloudWatch/SSM/STS → Interface endpoints · package downloads → bake into AMI.
+**Decision rule:** Gateway endpoints → **always** add (free). Interface endpoints (~$7.20/mo each per AZ) → only when data cost > endpoint cost (ECR break-even ≈ 320 GB/mo).
+
+```hcl
+resource "aws_vpc_endpoint" "gateway" {
+  for_each = { s3 = "com.amazonaws.${data.aws_region.current.name}.s3", dynamodb = "com.amazonaws.${data.aws_region.current.name}.dynamodb" }
+  vpc_id = aws_vpc.main.id  service_name = each.value  vpc_endpoint_type = "Gateway"
+  route_table_ids = aws_route_table.private[*].id
+}
+resource "aws_vpc_endpoint" "interface" {
+  for_each = var.enable_interface_endpoints ? local.interface_endpoints : {}   # ecr_api, ecr_dkr, logs, ssm, sts, secretsmanager…
+  vpc_id = aws_vpc.main.id  service_name = each.value.service_name  vpc_endpoint_type = "Interface"
+  subnet_ids = aws_subnet.private[*].id  security_group_ids = [aws_security_group.vpc_endpoints.id]
+  private_dns_enabled = true
+}
+```
+**Inter-AZ:** enable VPC Flow Logs → CloudWatch Insights to find heavy AZ↔AZ talkers; app→DB: read replica in the same AZ; service→service: **topology-aware routing** (`service.kubernetes.io/topology-mode: Auto`) **plus** `topologySpreadConstraints` so every AZ has a pod to route to.
+**Single vs per-AZ NAT:** one NAT saves ~$33/mo but is a single point of failure for *outbound* only (ingress unaffected). Accept for cost-sensitive/non-prod; keep per-AZ NAT for critical paths. Mitigate with interface endpoints for critical AWS services, health alarms, and app retries.
+
+## E.7 CloudFront & S3 lifecycle
+
+**CloudFront:** origin→CloudFront transfer is free; edge egress ≈ $0.0085–$0.12/GB (avg ~$0.02) vs $0.09/GB direct; with an 80–95% cache-hit rate most traffic never touches your origin. Example: 15 TB/mo direct ≈ $1,350 vs a small fraction via CDN. Use `PriceClass_100`, cache static assets (1-day default TTL), **don't** cache `/api/*` or `/health`, S3 origin with **OAC** for the cheapest static hosting.
+
+**S3 lifecycle (logs):**
+```hcl
+resource "aws_s3_bucket_lifecycle_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  rule { id = "tier-down" status = "Enabled" filter { prefix = "logs/" }
+    transition { days = 30  storage_class = "STANDARD_IA" }       # $0.023 → $0.0125/GB
+    transition { days = 90  storage_class = "GLACIER" }           # → $0.004/GB
+    transition { days = 365 storage_class = "DEEP_ARCHIVE" }      # → $0.00099/GB
+    expiration { days = 2555 } }                                  # 7 years (compliance)
+  rule { id = "abort-multipart" status = "Enabled" filter {} abort_incomplete_multipart_upload { days_after_initiation = 7 } }
+  rule { id = "old-versions" status = "Enabled" filter {}
+    noncurrent_version_transition { noncurrent_days = 30  storage_class = "GLACIER" }
+    noncurrent_version_expiration { noncurrent_days = 90 } }
+}
+```
+1 TB of logs for a year: ~$276 flat → ~$84 tiered (**≈70% off**). Apply lifecycle on **logs**, not live app data (Glacier retrieval has cost/delay).
+
+## E.8 Commitments — Savings Plans & Reserved Instances
+
+- Commit to the **minimum steady baseline** (your lowest month), never the peak. Look at 60–90 days: `aws ce get-savings-plans-purchase-recommendation --savings-plans-type COMPUTE_SP --term-in-years ONE_YEAR --payment-option NO_UPFRONT --lookback-period-in-days SIXTY_DAYS` (the source had a typo with underscores).
+- **Compute Savings Plan (best default):** any EC2 family/size/region/OS, also Fargate + Lambda, up to ~66% off. **EC2 Instance SP:** bigger discount (≤72%) but locked to family+region — only if certain.
+- Payment: No Upfront (lowest commitment, ~30% off) → Partial → All Upfront (highest).
+- **EKS combo:** On-Demand system nodes → Savings Plan on that baseline; Spot app nodes → no SP needed (Spot discount applies).
+- **RDS Reserved Instances** for the always-on DB: e.g. `db.t3.medium` Multi-AZ $99.28/mo → $59.86/mo (**−40%**). Find offerings with `aws rds describe-reserved-db-instances-offerings`, buy with `purchase-reserved-db-instances-offering`.
+
+## E.9 Before → After (example report, illustrative)
+
+| Category | Before | After | Saving | Main levers |
+|---|---|---|---|---|
+| Compute | $659 | $164 | **−75%** | Spot app nodes, Graviton, dev scheduling, Savings Plan, bastion → SSM/t3.nano |
+| Database | $132 | $80 | −39% | RDS 1-yr RI, gp2→gp3 + right-sized storage |
+| Networking | $160 | $102 | −36% | S3/DynamoDB endpoints, 2→1 NAT, CloudFront, topology routing |
+| Storage | $130 | $62 | −53% | delete orphans, gp2→gp3, snapshot cleanup, S3 lifecycle |
+| LB + monitoring | $40 | $40 | 0% | — |
+| **Total** | **$1,121** | **$447** | **−60% ($674/mo, ~$8.1k/yr)** | |
+
+**Per-optimization snapshot:** Spot app nodes −$294 · Graviton system nodes −$84 · dev scheduling −$70 · RDS RI −$39 · CloudFront −$36 · single NAT −$33 · S3 lifecycle −$29 · S3 endpoint −$22 · delete unattached EBS −$20 · RDS gp3 −$11 · EBS gp2→gp3 −$10 · Savings Plan ~−$11.
+
+**Risk map:** *Low risk/high savings* — Spot (NTH, stateless), Graviton (multi-arch tested), dev scheduling, free endpoints, S3 lifecycle. *Medium* — single NAT (outbound SPOF → alarm + retries; keep 2 for critical paths), RDS RI (1-yr commitment; can be modified/sold). *No risk* — gp2→gp3, delete orphans (**snapshot first**), old snapshots.
+
+**Rollout order**
+- **Week 1 — free/no-risk wins (~$150/mo):** S3/DynamoDB endpoints · gp2→gp3 · delete unattached EBS · S3 lifecycle · dev scheduling.
+- **Week 2 — medium effort, big return (~$550/mo cumulative):** multi-arch CI · Graviton + Spot node groups · migrate app then system nodes · run 14 days and measure Spot interruption rate.
+- **Week 3 — commitments & polish (~$674/mo):** RDS RI · Savings Plan · CloudFront · topology routing · NAT 2→1 (carefully).
+
+## E.10 Ongoing cost governance
+
+**Weekly:** Cost Explorer anomalies · Spot interruption rate (target < 5%/wk) · daily-spend alarm (> $50/day jump) · Compute Optimizer recs.
+**Monthly:** top-10 drivers · VPA recs → update requests · idle EC2/EBS · data-transfer spikes.
+**Quarterly:** Savings Plan/RI coverage + renewal · RDS size still right? · Graviton vs new x86 generation · NAT vs endpoint trade-off.
+**Automated:** `aws budgets create-budget` (alert at 80%) · Cost Anomaly Detection · `EstimatedCharges` → SNS → Slack.
+
+**Habits:** never run x86 On-Demand for stateless work · requests from VPA data · tag everything (untagged = untracked) · S3/DynamoDB endpoints on every new VPC · schedule every dev/test resource · **snapshot before deleting a volume** · measure Spot interruption rate · commit Savings Plans only to true baseline · Monday-morning 15-min Cost Explorer review.
+
+**Checklist (explain):** why Spot is safe for stateless · the 2-minute warning + NTH · why Graviton is cheaper *and* faster · multi-arch images · Compute SP vs EC2 Instance SP · NAT fixed vs variable cost · why gateway endpoints are free · inter-AZ costs · VPA recommendation-only · CloudFront cache-hit rate. **(Labs):** Cost Explorer top-5 · EC2 14-day CPU · pod requests vs usage · unattached EBS quantified · NAT bytes queried · Spot node group + NTH · multi-arch image · Graviton pod verified on arm64 · dev schedule · S3 endpoint · gp2→gp3 · orphan EBS deleted · lifecycle on log bucket · CloudFront · before/after with **your real numbers** · Cost Anomaly Detection.
+
+---
+
+# F. Reliability, Observability & Portfolio
+
+## F.1 Observability to build
+kube-prometheus-stack, all targets UP · **golden-signals dashboard** (errors, latency, traffic, saturation) as a ConfigMap · **SLO panel** (30-day availability + error budget remaining) · custom `PrometheusRule`s for app metrics · SLO definitions (availability + latency) as rules · Alertmanager: critical → PagerDuty, warning → Slack · **inhibition rules** (suppress symptoms when the root cause is already firing) · alert on **user-impacting symptoms**, not every cause.
+
+## F.2 Chaos engineering — hypothesis → experiment → result → fix
+Tool: **Chaos Mesh** (install + dashboard). Document every experiment as *hypothesis / expected vs actual / pass?/ action*.
+
+| # | Experiment | Hypothesis | Typical finding → fix |
+|---|---|---|---|
+| 1 | **Pod kill** (1 of 3) | error rate < 0.1%, replacement < 120 s | passes: ~47 s recovery |
+| 2 | **Network latency +500 ms** | P99 breaches but errors < 1% | retries/timeouts keep errors low |
+| 3 | **Memory stress** (+256 MB) | OOM then recovery < 60 s | OOMKilled handled; restart ~34 s |
+| 4 | **AZ failure** (kill all nodes in one AZ) | < 30 s impact | **FAILED first time**: uneven spread (4 pods in 1a, 2 in 1b), HPA slow. Fix: `topologySpreadConstraints maxSkew 1`, `minReplicas 3→6` (2/AZ), PDB `minAvailable 4`, balloon pods → retest ~28 s ✅ |
+| 5 | **DB connection exhaustion** | PgBouncer prevents cascade | passes after postmortem fix |
+
+**MTTR table to produce:** MTTD and MTTR per failure type, *before* and *after* each fix (pod kill, node failure, AZ failure, DB exhaustion, latency). **Next:** weekly chaos in staging, monthly in prod, chaos in CI, add DNS/cert-expiry/etcd experiments.
+
+## F.3 Postmortem template (blameless)
+
+```markdown
+# Postmortem: <title>
+Date · Severity (SEV-1…) · Duration · Author · Status
+## Summary            (what broke, who was affected, how long)
+## Timeline           | time | event |   → MTTD, MTTR
+## Root cause         (with the offending code/config)
+## Impact             (users %, revenue, duration)
+## Detection          what worked / what didn't
+## Resolution         immediate mitigation (e.g. terminate idle connections) + permanent fix
+## Action items       | action | owner | due | status |
+## Lessons learned
+## Blameless note     focus on systems and process, not people
+```
+**Worked example (illustrative):** connection leak (conn not closed on exception) exhausted a 100-connection Postgres pool → 23-minute SEV-1. Fixes: context managers for all DB connections · **PgBouncer** (1000 app conns → 20 DB conns) · alert at **DB connections > 80%** · code-review checklist item · chaos test for exhaustion. Lessons: connection limits are silent killers (alert at 80%, not 100%); pooling isn't optional; reviews must check resource cleanup.
+
+## F.4 Scaling benchmarks to capture
+HPA (spike → pods serving; e.g. ~75 s breakdown) · Cluster Autoscaler (Pending → Running; ~110 s, ~45 s with balloon pods) · Spot interruption (graceful drain → 0 s user-facing errors; interruption rate over 30 days) · **k6 load test table** (RPS vs error rate vs P99 vs pods vs nodes; find max RPS before SLO breach) · **cost per million requests** = monthly infra cost ÷ monthly requests.
+
+## F.5 The portfolio repository
+
+```
+devops-portfolio/
+├── README.md             ← landing page (stack, key decisions, result tables, security posture, modules)
+├── architecture/         overview · vpc · eks · cicd · diagrams/{production,cicd-flow,gitops-flow,network}.png
+├── postmortems/          README + 2+ real postmortems from your labs
+├── cost-optimization/    case-study (before/after) · methodology · savings-by-technique
+├── security/             threat model · scan-results/ (trivy, tfsec, checkov) · iam-design (IRSA)
+├── reliability/          chaos-engineering · slo-definitions · mttr-report · scaling-benchmarks
+└── runbooks/             high-error-rate · pod-crashloop · node-failure · database-issues
+```
+**README landing page should contain:** what it is + core skills · architecture sketch (Internet → Route53 → CloudFront → ALB → private EKS [system + app nodes] → private RDS) · key design decisions (private cluster, IRSA everywhere, GitOps-only changes, SLO-driven alerting, Graviton+Spot) · **reliability results table** · **cost results table** · **security posture list** (IRSA/OIDC no static creds, image + IaC + secret scanning, policy-as-code, default-deny network policies, restricted PSS, cosign signing) · modules completed.
+
+> **Credibility rule:** every number in these tables must come from *your* labs and be tagged **verified / configured / planned**. Interviewers will probe; a smaller honest result beats an impressive invented one.
+
+**Final checklist:** Observability (all boxes in F.1) · Chaos (5 experiments documented) · Portfolio (README, architecture diagrams, ≥2 postmortems, cost case study, security, reliability, benchmarks, ≥4 runbooks) · MTTR measured (pod < 2 min, node < 5 min, AZ < 5 min after topology fix, DB connection exhaustion mitigated).
+
+---
+
+# G. How Everything Connects & Master Checklist
+
+## G.1 Dependency map
+
+| Layer | Provides | Used by |
+|---|---|---|
+| **Linux** (cgroups, OOM, signals) | CPU/memory limits, graceful shutdown | pod `requests/limits`, HPA %, preStop/SIGTERM |
+| **Networking** (TCP, TLS, DNS, NAT, VPC) | routes, endpoints, NAT cost | private cluster, ALB, webhooks to ArgoCD, endpoint savings |
+| **IAM** (policy eval, IRSA, OIDC) | credentials without keys | pods → AWS, CA → ASG, CI → AWS via OIDC, cert-manager → Route53 |
+| **Kubernetes control plane** (scheduler, HPA controller, kubelet) | placement, scaling decisions | autoscaling chain, PDBs, drains |
+| **EKS** (Module A) | the cluster | ArgoCD, HPA/CA, Spot/Graviton nodes |
+| **Terraform** (Module C) | provisions VPC/IAM/EKS/node groups/ArgoCD | everything above, reproducibly |
+| **CI/CD + GitOps** (Module D) | builds, scans, signs, deploys (multi-arch images for Graviton) | every app change |
+| **Autoscaling** (Module B) | elastic capacity | Spot/Graviton cost wins |
+| **Cost** (Module E) | lower bill | endpoints, lifecycle, RIs/SPs, rightsizing from VPA |
+| **Observability + chaos** (Module F) | proof it works | SLOs, MTTR, portfolio evidence |
+
+## G.2 Master production habits
+
+**Infra:** read every plan · remote state with versioning+encryption+locking · pin providers · tag everything · PR review · never console-click · never commit state/secrets.
+**Cluster:** private API · IRSA only (no static keys) · default-deny network · PSS restricted · RBAC least privilege · Kyverno guardrails · requests+limits · probes · HPA+PDB+topology spread · rolling updates `maxUnavailable: 0`.
+**Delivery:** everything via Git · never `kubectl apply` in prod · revert, don't reset · sign + verify images · scan before push · secrets via External Secrets Operator · Slack on sync failures · keep `prune`/`selfHeal` on.
+**Scaling/cost:** scale up fast / down slow · requests = real usage (VPA) · Spot + Graviton for stateless · diversify Spot pools · balloon pods for buffer · gateway endpoints on every VPC · schedule non-prod · commit only to baseline · review costs weekly.
+**Reliability:** SLO-driven alerts · chaos-test your assumptions · blameless postmortems · runbooks for every page · measure MTTD/MTTR.
+
+## G.3 Study path (suggested order of hands-on work)
+
+1. **A** — build the private VPC + cluster by hand, IRSA, ALB, cert-manager, monitoring, hardening.
+2. **B** — metrics-server, HPA, CA, Spot + NTH; run the spike simulation; record timestamps.
+3. **C** — rebuild A as Terraform modules; break and recover state; install ArgoCD; App of Apps.
+4. **D** — wire the full pipeline with security gates; break each gate on purpose; practise drift + rollback.
+5. **E** — audit, then apply the cost levers in the week-1/2/3 order; capture before/after numbers.
+6. **F** — dashboards + SLOs, chaos experiments, postmortems, benchmarks → assemble the portfolio repo with **verified** numbers.
+
+> *Go build it. Break it. Fix it. Capture the numbers. Come back when it runs green and the cluster never drifts.*
+# --------------------------------------------------
 # Forge: Internal Developer Platform on GCP
 
 ## Part 1 — Explain This to a Non-Technical Person
