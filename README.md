@@ -1,3 +1,243 @@
+# Robotic Arm Repair (Center4Tech, 2023)
+
+A factual record of one repair I did during my industrial attachment at Center4Tech. It says only what I can back up. Where something rests on my memory, it says so.
+
+## Evidence labels
+
+- **Documented:** supported by a letter, message or document I hold.
+- **My recollection:** I remember it, but nothing shows it.
+- **Photograph:** a photo shows the arm existed. It does not show the repair.
+
+## At a glance
+
+| | |
+|---|---|
+| What | Repair of a white robotic arm with servo motors on a base board, damaged in transport |
+| Where | Center4Tech (documented) |
+| When | Before the summer camp, during my training period (my recollection) |
+| My role | Industrial attachment student |
+| Trained by | A supervising engineer, from 29 May 2023 |
+| Time spent | [FILL or delete] |
+| Result | [FILL: what I can honestly say about the outcome] |
+
+## Background
+
+I started my attachment on 29 May 2023 with no hands-on building experience. A supervising engineer trained me. This repair was one of the prototypes I worked on in that training period, before I led a class from 24 July 2023.
+
+## The arm
+
+What I can say:
+
+- It is white, with servo motors, mounted on a base board (photograph).
+
+What I need to fill or leave out:
+
+- Number of servos: [FILL]
+- Controller board: [FILL]
+- Power supply: [FILL]
+- Who built the arm and for what purpose: [FILL or "I do not know"]
+
+## Timeline
+
+| Phase | Event | Basis |
+|---|---|---|
+| 29 May 2023 | Attachment starts, training begins | Documented |
+| Before 24 July 2023 | The arm is damaged in transport and I repair it | My recollection |
+| [FILL] | [FILL: discovery of the damage] | [FILL] |
+| [FILL] | [FILL: repair finished] | [FILL] |
+
+## Finding the fault
+
+[FILL: how I worked out what was wrong, in the order I really did it. For example what I looked at first, what I tested, what I ruled out.]
+
+## Repair log
+
+| Step | What I did | What I saw | Basis |
+|---|---|---|---|
+| 1 | [FILL] | [FILL] | [FILL] |
+| 2 | [FILL] | [FILL] | [FILL] |
+| 3 | [FILL] | [FILL] | [FILL] |
+
+## Testing and result
+
+- What I did to check it worked: [FILL. If I did not test it, write "I did not record a test."]
+- What I can honestly say about the result: [FILL]
+- What I cannot say: whether it kept working after my attachment ended.
+
+## Who did what
+
+| Task | Me | Supervising engineer |
+|---|---|---|
+| Diagnosis | [FILL] | [FILL] |
+| Parts or wiring | [FILL] | [FILL] |
+| Testing | [FILL] | [FILL] |
+
+If I do not remember, I write "I do not remember."
+
+## Evidence index
+
+| Claim | Evidence | Label |
+|---|---|---|
+| The arm existed | Video still, cropped to remove a person: `04-evidence/photos/hardware/robotic-arm-video-still-cropped-01.png` | Photograph |
+| Damaged in transport | [FILL] | [FILL] |
+| I repaired it | [FILL] | [FILL] |
+| It worked afterwards | [FILL] | [FILL] |
+
+The full video still shows a person, so it is kept private.
+
+## Skills I used
+
+Only skills that appear in the repair log above. Delete any I cannot point to.
+
+- [FILL: for example reading a wiring layout, using a multimeter, soldering, servo testing]
+
+## What I learned
+
+[FILL: two or three honest sentences about this repair. Keep it a reflection, not a result.]
+
+## Limits
+
+- The photo shows the arm, not the repair.
+- I cannot show who did which step.
+- [FILL: anything else I cannot prove]
+
+## Not claimed
+
+I do not claim any of the following:
+
+- That I designed or built the arm
+- Any performance numbers, accuracy figures or time savings
+- That I worked alone
+- That this was production work or a client project
+- Anything about the arm after my attachment ended
+
+## If I am asked
+
+| Question | My answer |
+|---|---|
+| Did you build it? | [FILL: true answer only] |
+| What was broken? | [FILL] |
+| How do you know it worked? | [FILL, or "I did not record a test"] |
+| Who helped you? | A supervising engineer trained me. [FILL: what they did on this repair] |
+| What would you do differently? | [FILL] |
+
+## 20-second version
+
+"During my industrial attachment at Center4Tech, I repaired a robotic arm that had been damaged in transport. I had no hands-on building experience when I started, and a supervising engineer trained me. [FILL: the fault and the fix]. I can show a photo that the arm existed, but not the repair itself."
+
+## Related
+
+- Center4Tech overview: github.com/velrite/center4tech-experience
+- Case study page: `02-project-case-studies/robotic-arm-repair.md`
+
+# -----------------------------------------------------------------
+
+# My Time at Center4Tech (2023)
+
+A factual record of my industrial attachment and my work at Center4Tech. It says only what I can back up. Where something rests on my memory, it says so.
+
+## Evidence labels
+
+- **Documented:** supported by a letter or document I hold (university letter, offer letter).
+- **My recollection:** I remember it, but no document shows it.
+- **Photograph:** a photo shows the thing existed. It does not show who built it or how well it worked.
+
+## Summary
+
+I joined Center4Tech without hands-on building experience. A supervising engineer trained me from 29 May 2023. I was leading a class from 24 July 2023, eight weeks later. I also built and repaired prototypes for the program before and after the camp, including a robotic arm that was damaged in transport.
+
+## Dates
+
+| What | Dates | Basis |
+|---|---|---|
+| Industrial attachment | 29 May to 17 Sept 2023 | Documented (university letter, offer letter) |
+| Training before the camp | 29 May to 24 July 2023 | Documented start; the rest is my recollection |
+| Young Inventors Summer Camp, Ogudu center | 24 July to 25 Aug 2023 | Documented (offer letter) |
+| After the camp | 25 Aug to 17 Sept 2023 | Documented end date |
+
+## My role
+
+- Industrial attachment student, then **Lead Instructor** for the Young Inventors Summer Camp. The Lead Instructor title is documented by my offer letter.
+- I taught a class of **13 students**.
+- I gave **two Tech & Career Talks** to about **40 students** in total. The 13 and the 40 are different groups. Do not mix them.
+- I took part in the Tech Expo.
+
+## What I built and repaired
+
+Which phase each project belongs to is my recollection.
+
+**Before the camp (training period):**
+- Robotic arm repair (the arm was damaged in transport)
+- Firefighting robot
+- Line follower, first version
+- Lamp
+- Air-freshener fan
+- Toy baby
+- Water-level monitor
+
+**During the camp:**
+- My students built the line follower and a take-home fan.
+- Two Tech & Career Talks
+- Tech Expo
+
+**After the camp:**
+- Traffic signal model
+- Laser security alarm
+- Bluetooth car
+- Dustbin
+- Keypad lock
+- Obstacle robot
+
+## Pattern behind the projects
+
+Almost every project follows one pattern:
+
+Sensor or input (ultrasonic, IR, LDR, keypad) → controller (Arduino) → actuator or output (servo, motor, fan, buzzer, LED) → physical result (a lid opens, a robot moves, an alarm sounds).
+
+This is a generic diagram I drew. The examples come from the projects above.
+
+## Photographs
+
+- 13 hardware-only photographs are in `04-evidence/photos/hardware/`, with captions.
+- Photographs showing students are not published.
+- The photographs show the projects existed. They do not show who designed them or how they performed.
+- Publication rests on Center4Tech's written permission. I keep a copy of that approval in my private records, not in this repository.
+
+## Looking back (hindsight, not a record)
+
+I am now moving into platform engineering and DevSecOps. I see a parallel between isolating a failed connection with a multimeter and isolating a failed component in a larger system. I offer that as an analogy.
+
+## Not claimed
+
+I do not claim any of the following:
+
+- That I designed the curriculum
+- Any results, scores or outcome numbers
+- More than 13 students in my class
+- A promotion from intern
+- Lab infrastructure or training materials that I built
+- Any dates after 17 Sept 2023
+- That this experience caused my later direction in engineering
+- That I alone designed or built everything in the photographs
+
+## Repository map
+
+- `02-project-case-studies/`: one page per project
+- `03-engineering-and-mentorship/`: engineering concepts and teaching
+- `04-evidence/`: evidence index and the hardware photographs
+- `05-lessons-learned/`: lessons and the hindsight note
+- `06-publication-policy/`: what I publish and what I withhold
+- `assets/`: the 2023 timeline and the sensor, controller, actuator diagram
+- `CHANGELOG.md`: dated record of changes
+
+## Change history note
+
+Two early commits (`f82e4b5` and `ac72be4`) have messages that say more than they contained. `f82e4b5` only changed text, because the photos were not added until `81b8b0f`. `ac72be4` added two diagrams only. The history was left as it is, and later commits fixed the content.
+
+## 30-second version
+
+"I did an industrial attachment at Center4Tech from May to September 2023. I started with no hands-on building experience. A supervising engineer trained me, and eight weeks later I was lead instructor for their summer camp, teaching 13 students. I also built and repaired prototypes, like a robotic arm damaged in transport, a traffic signal model and a laser alarm."
+# --------------------------------------------------
 # Forge: Internal Developer Platform on GCP
 
 ## Part 1 — Explain This to a Non-Technical Person
